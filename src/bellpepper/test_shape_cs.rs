@@ -1,18 +1,20 @@
-//! Support for generating R1CS shape using bellperson.
+//! Support for generating R1CS shape using bellpepper.
+//! `TestShapeCS` implements a superset of `ShapeCS`, adding non-trivial namespace support for use in testing.
 
 use std::{
   cmp::Ordering,
   collections::{BTreeMap, HashMap},
 };
 
-use crate::traits::Group;
-use bellperson::{ConstraintSystem, Index, LinearCombination, SynthesisError, Variable};
+use crate::traits::Engine;
+use bellpepper_core::{ConstraintSystem, Index, LinearCombination, SynthesisError, Variable};
 use core::fmt::Write;
 use ff::{Field, PrimeField};
 
 #[derive(Clone, Copy)]
 struct OrderedVariable(Variable);
 
+#[allow(unused)]
 #[derive(Debug)]
 enum NamedObject {
   Constraint(usize),
@@ -24,8 +26,7 @@ impl Eq for OrderedVariable {}
 impl PartialEq for OrderedVariable {
   fn eq(&self, other: &OrderedVariable) -> bool {
     match (self.0.get_unchecked(), other.0.get_unchecked()) {
-      (Index::Input(ref a), Index::Input(ref b)) => a == b,
-      (Index::Aux(ref a), Index::Aux(ref b)) => a == b,
+      (Index::Input(ref a), Index::Input(ref b)) | (Index::Aux(ref a), Index::Aux(ref b)) => a == b,
       _ => false,
     }
   }
@@ -38,28 +39,24 @@ impl PartialOrd for OrderedVariable {
 impl Ord for OrderedVariable {
   fn cmp(&self, other: &Self) -> Ordering {
     match (self.0.get_unchecked(), other.0.get_unchecked()) {
-      (Index::Input(ref a), Index::Input(ref b)) => a.cmp(b),
-      (Index::Aux(ref a), Index::Aux(ref b)) => a.cmp(b),
+      (Index::Input(ref a), Index::Input(ref b)) | (Index::Aux(ref a), Index::Aux(ref b)) => {
+        a.cmp(b)
+      }
       (Index::Input(_), Index::Aux(_)) => Ordering::Less,
       (Index::Aux(_), Index::Input(_)) => Ordering::Greater,
     }
   }
 }
 
-#[allow(clippy::upper_case_acronyms)]
-/// `ShapeCS` is a `ConstraintSystem` for creating `R1CSShape`s for a circuit.
-pub struct ShapeCS<G: Group>
-where
-  G::Scalar: PrimeField + Field,
-{
+/// `TestShapeCS` is a `ConstraintSystem` for creating `R1CSShape`s for a circuit.
+pub struct TestShapeCS<E: Engine> {
   named_objects: HashMap<String, NamedObject>,
   current_namespace: Vec<String>,
-  #[allow(clippy::type_complexity)]
-  /// All constraints added to the `ShapeCS`.
+  /// All constraints added to the `TestShapeCS`.
   pub constraints: Vec<(
-    LinearCombination<G::Scalar>,
-    LinearCombination<G::Scalar>,
-    LinearCombination<G::Scalar>,
+    LinearCombination<E::Scalar>,
+    LinearCombination<E::Scalar>,
+    LinearCombination<E::Scalar>,
     String,
   )>,
   inputs: Vec<String>,
@@ -92,26 +89,27 @@ fn proc_lc<Scalar: PrimeField>(
   map
 }
 
-impl<G: Group> ShapeCS<G>
+impl<E: Engine> TestShapeCS<E>
 where
-  G::Scalar: PrimeField,
+  E::Scalar: PrimeField,
 {
-  /// Create a new, default `ShapeCS`,
+  #[allow(unused)]
+  /// Create a new, default `TestShapeCS`,
   pub fn new() -> Self {
-    ShapeCS::default()
+    TestShapeCS::default()
   }
 
-  /// Returns the number of constraints defined for this `ShapeCS`.
+  /// Returns the number of constraints defined for this `TestShapeCS`.
   pub fn num_constraints(&self) -> usize {
     self.constraints.len()
   }
 
-  /// Returns the number of inputs defined for this `ShapeCS`.
+  /// Returns the number of inputs defined for this `TestShapeCS`.
   pub fn num_inputs(&self) -> usize {
     self.inputs.len()
   }
 
-  /// Returns the number of aux inputs defined for this `ShapeCS`.
+  /// Returns the number of aux inputs defined for this `TestShapeCS`.
   pub fn num_aux(&self) -> usize {
     self.aux.len()
   }
@@ -144,16 +142,16 @@ where
       writeln!(s, "INPUT {}", &input).unwrap()
     }
 
-    let negone = -<G::Scalar>::ONE;
+    let negone = -<E::Scalar>::ONE;
 
-    let powers_of_two = (0..G::Scalar::NUM_BITS)
-      .map(|i| G::Scalar::from(2u64).pow_vartime([u64::from(i)]))
+    let powers_of_two = (0..E::Scalar::NUM_BITS)
+      .map(|i| E::Scalar::from(2u64).pow_vartime([u64::from(i)]))
       .collect::<Vec<_>>();
 
-    let pp = |s: &mut String, lc: &LinearCombination<G::Scalar>| {
+    let pp = |s: &mut String, lc: &LinearCombination<E::Scalar>| {
       s.push('(');
       let mut is_first = true;
-      for (var, coeff) in proc_lc::<G::Scalar>(lc) {
+      for (var, coeff) in proc_lc::<E::Scalar>(lc) {
         if coeff == negone {
           s.push_str(" - ")
         } else if !is_first {
@@ -161,7 +159,7 @@ where
         }
         is_first = false;
 
-        if coeff != <G::Scalar>::ONE && coeff != negone {
+        if coeff != <E::Scalar>::ONE && coeff != negone {
           for (i, x) in powers_of_two.iter().enumerate() {
             if x == &coeff {
               write!(s, "2^{i} . ").unwrap();
@@ -216,14 +214,11 @@ where
   }
 }
 
-impl<G: Group> Default for ShapeCS<G>
-where
-  G::Scalar: PrimeField,
-{
+impl<E: Engine> Default for TestShapeCS<E> {
   fn default() -> Self {
     let mut map = HashMap::new();
-    map.insert("ONE".into(), NamedObject::Var(ShapeCS::<G>::one()));
-    ShapeCS {
+    map.insert("ONE".into(), NamedObject::Var(TestShapeCS::<E>::one()));
+    TestShapeCS {
       named_objects: map,
       current_namespace: vec![],
       constraints: vec![],
@@ -233,15 +228,15 @@ where
   }
 }
 
-impl<G: Group> ConstraintSystem<G::Scalar> for ShapeCS<G>
+impl<E: Engine> ConstraintSystem<E::Scalar> for TestShapeCS<E>
 where
-  G::Scalar: PrimeField,
+  E::Scalar: PrimeField,
 {
   type Root = Self;
 
   fn alloc<F, A, AR>(&mut self, annotation: A, _f: F) -> Result<Variable, SynthesisError>
   where
-    F: FnOnce() -> Result<G::Scalar, SynthesisError>,
+    F: FnOnce() -> Result<E::Scalar, SynthesisError>,
     A: FnOnce() -> AR,
     AR: Into<String>,
   {
@@ -253,7 +248,7 @@ where
 
   fn alloc_input<F, A, AR>(&mut self, annotation: A, _f: F) -> Result<Variable, SynthesisError>
   where
-    F: FnOnce() -> Result<G::Scalar, SynthesisError>,
+    F: FnOnce() -> Result<E::Scalar, SynthesisError>,
     A: FnOnce() -> AR,
     AR: Into<String>,
   {
@@ -267,9 +262,9 @@ where
   where
     A: FnOnce() -> AR,
     AR: Into<String>,
-    LA: FnOnce(LinearCombination<G::Scalar>) -> LinearCombination<G::Scalar>,
-    LB: FnOnce(LinearCombination<G::Scalar>) -> LinearCombination<G::Scalar>,
-    LC: FnOnce(LinearCombination<G::Scalar>) -> LinearCombination<G::Scalar>,
+    LA: FnOnce(LinearCombination<E::Scalar>) -> LinearCombination<E::Scalar>,
+    LB: FnOnce(LinearCombination<E::Scalar>) -> LinearCombination<E::Scalar>,
+    LC: FnOnce(LinearCombination<E::Scalar>) -> LinearCombination<E::Scalar>,
   {
     let path = compute_path(&self.current_namespace, &annotation().into());
     let index = self.constraints.len();

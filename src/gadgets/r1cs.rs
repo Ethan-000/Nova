@@ -13,113 +13,93 @@ use crate::{
     },
   },
   r1cs::{R1CSInstance, RelaxedR1CSInstance},
-  traits::{commitment::CommitmentTrait, Group, ROCircuitTrait, ROConstantsCircuit},
+  traits::{commitment::CommitmentTrait, Engine, Group, ROCircuitTrait, ROConstantsCircuit},
 };
-use bellperson::{
-  gadgets::{boolean::Boolean, num::AllocatedNum, Assignment},
-  ConstraintSystem, SynthesisError,
-};
+use bellpepper::gadgets::{boolean::Boolean, num::AllocatedNum, Assignment};
+use bellpepper_core::{ConstraintSystem, SynthesisError};
 use ff::Field;
 
 /// An Allocated R1CS Instance
 #[derive(Clone)]
-pub struct AllocatedR1CSInstance<G: Group> {
-  pub(crate) W: AllocatedPoint<G>,
-  pub(crate) X0: AllocatedNum<G::Base>,
-  pub(crate) X1: AllocatedNum<G::Base>,
+pub struct AllocatedR1CSInstance<E: Engine> {
+  pub(crate) W: AllocatedPoint<E>,
+  pub(crate) X0: AllocatedNum<E::Base>,
+  pub(crate) X1: AllocatedNum<E::Base>,
 }
 
-impl<G: Group> AllocatedR1CSInstance<G> {
+impl<E: Engine> AllocatedR1CSInstance<E> {
   /// Takes the r1cs instance and creates a new allocated r1cs instance
-  pub fn alloc<CS: ConstraintSystem<<G as Group>::Base>>(
+  pub fn alloc<CS: ConstraintSystem<<E as Engine>::Base>>(
     mut cs: CS,
-    u: Option<R1CSInstance<G>>,
+    u: Option<&R1CSInstance<E>>,
   ) -> Result<Self, SynthesisError> {
-    // Check that the incoming instance has exactly 2 io
     let W = AllocatedPoint::alloc(
       cs.namespace(|| "allocate W"),
-      u.get().map_or(None, |u| Some(u.comm_W.to_coordinates())),
+      u.map(|u| u.comm_W.to_coordinates()),
     )?;
+    W.check_on_curve(cs.namespace(|| "check W on curve"))?;
 
-    let X0 = alloc_scalar_as_base::<G, _>(
-      cs.namespace(|| "allocate X[0]"),
-      u.get().map_or(None, |u| Some(u.X[0])),
-    )?;
-    let X1 = alloc_scalar_as_base::<G, _>(
-      cs.namespace(|| "allocate X[1]"),
-      u.get().map_or(None, |u| Some(u.X[1])),
-    )?;
+    let X0 = alloc_scalar_as_base::<E, _>(cs.namespace(|| "allocate X[0]"), u.map(|u| u.X[0]))?;
+    let X1 = alloc_scalar_as_base::<E, _>(cs.namespace(|| "allocate X[1]"), u.map(|u| u.X[1]))?;
 
     Ok(AllocatedR1CSInstance { W, X0, X1 })
   }
 
   /// Absorb the provided instance in the RO
-  pub fn absorb_in_ro(&self, ro: &mut G::ROCircuit) {
-    ro.absorb(self.W.x.clone());
-    ro.absorb(self.W.y.clone());
-    ro.absorb(self.W.is_infinity.clone());
-    ro.absorb(self.X0.clone());
-    ro.absorb(self.X1.clone());
+  pub fn absorb_in_ro(&self, ro: &mut E::ROCircuit) {
+    ro.absorb(&self.W.x);
+    ro.absorb(&self.W.y);
+    ro.absorb(&self.W.is_infinity);
+    ro.absorb(&self.X0);
+    ro.absorb(&self.X1);
   }
 }
 
 /// An Allocated Relaxed R1CS Instance
-pub struct AllocatedRelaxedR1CSInstance<G: Group> {
-  pub(crate) W: AllocatedPoint<G>,
-  pub(crate) E: AllocatedPoint<G>,
-  pub(crate) u: AllocatedNum<G::Base>,
-  pub(crate) X0: BigNat<G::Base>,
-  pub(crate) X1: BigNat<G::Base>,
+pub struct AllocatedRelaxedR1CSInstance<E: Engine> {
+  pub(crate) W: AllocatedPoint<E>,
+  pub(crate) E: AllocatedPoint<E>,
+  pub(crate) u: AllocatedNum<E::Base>,
+  pub(crate) X0: BigNat<E::Base>,
+  pub(crate) X1: BigNat<E::Base>,
 }
 
-impl<G: Group> AllocatedRelaxedR1CSInstance<G> {
-  /// Allocates the given RelaxedR1CSInstance as a witness of the circuit
-  pub fn alloc<CS: ConstraintSystem<<G as Group>::Base>>(
+impl<E: Engine> AllocatedRelaxedR1CSInstance<E> {
+  /// Allocates the given `RelaxedR1CSInstance` as a witness of the circuit
+  pub fn alloc<CS: ConstraintSystem<<E as Engine>::Base>>(
     mut cs: CS,
-    inst: Option<RelaxedR1CSInstance<G>>,
+    inst: Option<&RelaxedR1CSInstance<E>>,
     limb_width: usize,
     n_limbs: usize,
   ) -> Result<Self, SynthesisError> {
+    // We do not need to check that W or E are well-formed (e.g., on the curve) as we do a hash check
+    // in the Nova augmented circuit, which ensures that the relaxed instance
+    // came from a prior iteration of Nova.
     let W = AllocatedPoint::alloc(
       cs.namespace(|| "allocate W"),
-      inst
-        .get()
-        .map_or(None, |inst| Some(inst.comm_W.to_coordinates())),
+      inst.map(|inst| inst.comm_W.to_coordinates()),
     )?;
 
     let E = AllocatedPoint::alloc(
       cs.namespace(|| "allocate E"),
-      inst
-        .get()
-        .map_or(None, |inst| Some(inst.comm_E.to_coordinates())),
+      inst.map(|inst| inst.comm_E.to_coordinates()),
     )?;
 
-    // u << |G::Base| despite the fact that u is a scalar.
-    // So we parse all of its bytes as a G::Base element
-    let u = alloc_scalar_as_base::<G, _>(
-      cs.namespace(|| "allocate u"),
-      inst.get().map_or(None, |inst| Some(inst.u)),
-    )?;
+    // u << |E::Base| despite the fact that u is a scalar.
+    // So we parse all of its bytes as a E::Base element
+    let u = alloc_scalar_as_base::<E, _>(cs.namespace(|| "allocate u"), inst.map(|inst| inst.u))?;
 
     // Allocate X0 and X1. If the input instance is None, then allocate default values 0.
     let X0 = BigNat::alloc_from_nat(
       cs.namespace(|| "allocate X[0]"),
-      || {
-        Ok(f_to_nat(
-          &inst.clone().map_or(G::Scalar::ZERO, |inst| inst.X[0]),
-        ))
-      },
+      || Ok(f_to_nat(&inst.map_or(E::Scalar::ZERO, |inst| inst.X[0]))),
       limb_width,
       n_limbs,
     )?;
 
     let X1 = BigNat::alloc_from_nat(
       cs.namespace(|| "allocate X[1]"),
-      || {
-        Ok(f_to_nat(
-          &inst.clone().map_or(G::Scalar::ZERO, |inst| inst.X[1]),
-        ))
-      },
+      || Ok(f_to_nat(&inst.map_or(E::Scalar::ZERO, |inst| inst.X[1]))),
       limb_width,
       n_limbs,
     )?;
@@ -127,9 +107,9 @@ impl<G: Group> AllocatedRelaxedR1CSInstance<G> {
     Ok(AllocatedRelaxedR1CSInstance { W, E, u, X0, X1 })
   }
 
-  /// Allocates the hardcoded default RelaxedR1CSInstance in the circuit.
-  /// W = E = 0, u = 1, X0 = X1 = 0
-  pub fn default<CS: ConstraintSystem<<G as Group>::Base>>(
+  /// Allocates the hardcoded default `RelaxedR1CSInstance` in the circuit.
+  /// W = E = 0, u = 0, X0 = X1 = 0
+  pub fn default<CS: ConstraintSystem<<E as Engine>::Base>>(
     mut cs: CS,
     limb_width: usize,
     n_limbs: usize,
@@ -139,16 +119,19 @@ impl<G: Group> AllocatedRelaxedR1CSInstance<G> {
 
     let u = W.x.clone(); // In the default case, W.x = u = 0
 
+    // X0 and X1 are allocated and in the honest prover case set to zero
+    // If the prover is malicious, it can set to arbitrary values, but the resulting
+    // relaxed R1CS instance with the the checked default values of W, E, and u must still be satisfying
     let X0 = BigNat::alloc_from_nat(
       cs.namespace(|| "allocate x_default[0]"),
-      || Ok(f_to_nat(&G::Scalar::ZERO)),
+      || Ok(f_to_nat(&E::Scalar::ZERO)),
       limb_width,
       n_limbs,
     )?;
 
     let X1 = BigNat::alloc_from_nat(
       cs.namespace(|| "allocate x_default[1]"),
-      || Ok(f_to_nat(&G::Scalar::ZERO)),
+      || Ok(f_to_nat(&E::Scalar::ZERO)),
       limb_width,
       n_limbs,
     )?;
@@ -156,28 +139,28 @@ impl<G: Group> AllocatedRelaxedR1CSInstance<G> {
     Ok(AllocatedRelaxedR1CSInstance { W, E, u, X0, X1 })
   }
 
-  /// Allocates the R1CS Instance as a RelaxedR1CSInstance in the circuit.
+  /// Allocates the R1CS Instance as a `RelaxedR1CSInstance` in the circuit.
   /// E = 0, u = 1
-  pub fn from_r1cs_instance<CS: ConstraintSystem<<G as Group>::Base>>(
+  pub fn from_r1cs_instance<CS: ConstraintSystem<<E as Engine>::Base>>(
     mut cs: CS,
-    inst: AllocatedR1CSInstance<G>,
+    inst: AllocatedR1CSInstance<E>,
     limb_width: usize,
     n_limbs: usize,
   ) -> Result<Self, SynthesisError> {
-    let E = AllocatedPoint::default(cs.namespace(|| "allocate W"))?;
+    let E = AllocatedPoint::default(cs.namespace(|| "allocate default E"))?;
 
-    let u = alloc_one(cs.namespace(|| "one"))?;
+    let u = alloc_one(cs.namespace(|| "one"));
 
     let X0 = BigNat::from_num(
       cs.namespace(|| "allocate X0 from relaxed r1cs"),
-      Num::from(inst.X0.clone()),
+      &Num::from(inst.X0),
       limb_width,
       n_limbs,
     )?;
 
     let X1 = BigNat::from_num(
       cs.namespace(|| "allocate X1 from relaxed r1cs"),
-      Num::from(inst.X1.clone()),
+      &Num::from(inst.X1),
       limb_width,
       n_limbs,
     )?;
@@ -192,18 +175,18 @@ impl<G: Group> AllocatedRelaxedR1CSInstance<G> {
   }
 
   /// Absorb the provided instance in the RO
-  pub fn absorb_in_ro<CS: ConstraintSystem<<G as Group>::Base>>(
+  pub fn absorb_in_ro<CS: ConstraintSystem<<E as Engine>::Base>>(
     &self,
     mut cs: CS,
-    ro: &mut G::ROCircuit,
+    ro: &mut E::ROCircuit,
   ) -> Result<(), SynthesisError> {
-    ro.absorb(self.W.x.clone());
-    ro.absorb(self.W.y.clone());
-    ro.absorb(self.W.is_infinity.clone());
-    ro.absorb(self.E.x.clone());
-    ro.absorb(self.E.y.clone());
-    ro.absorb(self.E.is_infinity.clone());
-    ro.absorb(self.u.clone());
+    ro.absorb(&self.W.x);
+    ro.absorb(&self.W.y);
+    ro.absorb(&self.W.is_infinity);
+    ro.absorb(&self.E.x);
+    ro.absorb(&self.E.y);
+    ro.absorb(&self.E.is_infinity);
+    ro.absorb(&self.u);
 
     // Analyze X0 as limbs
     let X0_bn = self
@@ -214,11 +197,11 @@ impl<G: Group> AllocatedRelaxedR1CSInstance<G> {
       .map(|(i, limb)| {
         limb.as_allocated_num(cs.namespace(|| format!("convert limb {i} of X_r[0] to num")))
       })
-      .collect::<Result<Vec<AllocatedNum<G::Base>>, _>>()?;
+      .collect::<Result<Vec<AllocatedNum<E::Base>>, _>>()?;
 
     // absorb each of the limbs of X[0]
-    for limb in X0_bn.into_iter() {
-      ro.absorb(limb);
+    for limb in X0_bn {
+      ro.absorb(&limb);
     }
 
     // Analyze X1 as limbs
@@ -230,45 +213,46 @@ impl<G: Group> AllocatedRelaxedR1CSInstance<G> {
       .map(|(i, limb)| {
         limb.as_allocated_num(cs.namespace(|| format!("convert limb {i} of X_r[1] to num")))
       })
-      .collect::<Result<Vec<AllocatedNum<G::Base>>, _>>()?;
+      .collect::<Result<Vec<AllocatedNum<E::Base>>, _>>()?;
 
     // absorb each of the limbs of X[1]
-    for limb in X1_bn.into_iter() {
-      ro.absorb(limb);
+    for limb in X1_bn {
+      ro.absorb(&limb);
     }
 
     Ok(())
   }
 
   /// Folds self with a relaxed r1cs instance and returns the result
-  #[allow(clippy::too_many_arguments)]
-  pub fn fold_with_r1cs<CS: ConstraintSystem<<G as Group>::Base>>(
+  pub fn fold_with_r1cs<CS: ConstraintSystem<<E as Engine>::Base>>(
     &self,
     mut cs: CS,
-    params: AllocatedNum<G::Base>, // hash of R1CSShape of F'
-    u: AllocatedR1CSInstance<G>,
-    T: AllocatedPoint<G>,
-    ro_consts: ROConstantsCircuit<G>,
+    params: &AllocatedNum<E::Base>, // hash of R1CSShape of F'
+    u: &AllocatedR1CSInstance<E>,
+    T: &AllocatedPoint<E>,
+    ro_consts: ROConstantsCircuit<E>,
     limb_width: usize,
     n_limbs: usize,
-  ) -> Result<AllocatedRelaxedR1CSInstance<G>, SynthesisError> {
+  ) -> Result<AllocatedRelaxedR1CSInstance<E>, SynthesisError> {
     // Compute r:
-    let mut ro = G::ROCircuit::new(ro_consts, NUM_FE_FOR_RO);
+    let mut ro = E::ROCircuit::new(ro_consts, NUM_FE_FOR_RO);
     ro.absorb(params);
-    self.absorb_in_ro(cs.namespace(|| "absorb running instance"), &mut ro)?;
+
+    // running instance `U` does not need to absorbed since u.X[0] = Hash(params, U, i, z0, zi)
     u.absorb_in_ro(&mut ro);
-    ro.absorb(T.x.clone());
-    ro.absorb(T.y.clone());
-    ro.absorb(T.is_infinity.clone());
+
+    ro.absorb(&T.x);
+    ro.absorb(&T.y);
+    ro.absorb(&T.is_infinity);
     let r_bits = ro.squeeze(cs.namespace(|| "r bits"), NUM_CHALLENGE_BITS)?;
-    let r = le_bits_to_num(cs.namespace(|| "r"), r_bits.clone())?;
+    let r = le_bits_to_num(cs.namespace(|| "r"), &r_bits)?;
 
     // W_fold = self.W + r * u.W
-    let rW = u.W.scalar_mul(cs.namespace(|| "r * u.W"), r_bits.clone())?;
+    let rW = u.W.scalar_mul(cs.namespace(|| "r * u.W"), &r_bits)?;
     let W_fold = self.W.add(cs.namespace(|| "self.W + r * u.W"), &rW)?;
 
     // E_fold = self.E + r * T
-    let rT = T.scalar_mul(cs.namespace(|| "r * T"), r_bits)?;
+    let rT = T.scalar_mul(cs.namespace(|| "r * T"), &r_bits)?;
     let E_fold = self.E.add(cs.namespace(|| "self.E + r * T"), &rT)?;
 
     // u_fold = u_r + r
@@ -286,7 +270,7 @@ impl<G: Group> AllocatedRelaxedR1CSInstance<G> {
     // Analyze r into limbs
     let r_bn = BigNat::from_num(
       cs.namespace(|| "allocate r_bn"),
-      Num::from(r.clone()),
+      &Num::from(r),
       limb_width,
       n_limbs,
     )?;
@@ -294,7 +278,7 @@ impl<G: Group> AllocatedRelaxedR1CSInstance<G> {
     // Allocate the order of the non-native field as a constant
     let m_bn = alloc_bignat_constant(
       cs.namespace(|| "alloc m"),
-      &G::get_curve_params().2,
+      &E::GE::group_params().2,
       limb_width,
       n_limbs,
     )?;
@@ -302,7 +286,7 @@ impl<G: Group> AllocatedRelaxedR1CSInstance<G> {
     // Analyze X0 to bignat
     let X0_bn = BigNat::from_num(
       cs.namespace(|| "allocate X0_bn"),
-      Num::from(u.X0.clone()),
+      &Num::from(u.X0.clone()),
       limb_width,
       n_limbs,
     )?;
@@ -317,7 +301,7 @@ impl<G: Group> AllocatedRelaxedR1CSInstance<G> {
     // Analyze X1 to bignat
     let X1_bn = BigNat::from_num(
       cs.namespace(|| "allocate X1_bn"),
-      Num::from(u.X1.clone()),
+      &Num::from(u.X1.clone()),
       limb_width,
       n_limbs,
     )?;
@@ -339,12 +323,12 @@ impl<G: Group> AllocatedRelaxedR1CSInstance<G> {
   }
 
   /// If the condition is true then returns this otherwise it returns the other
-  pub fn conditionally_select<CS: ConstraintSystem<<G as Group>::Base>>(
+  pub fn conditionally_select<CS: ConstraintSystem<<E as Engine>::Base>>(
     &self,
     mut cs: CS,
-    other: AllocatedRelaxedR1CSInstance<G>,
+    other: &AllocatedRelaxedR1CSInstance<E>,
     condition: &Boolean,
-  ) -> Result<AllocatedRelaxedR1CSInstance<G>, SynthesisError> {
+  ) -> Result<AllocatedRelaxedR1CSInstance<E>, SynthesisError> {
     let W = AllocatedPoint::conditionally_select(
       cs.namespace(|| "W = cond ? self.W : other.W"),
       &self.W,

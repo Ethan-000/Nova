@@ -1,12 +1,10 @@
 //! This module implements various low-level gadgets
 use super::nonnative::bignat::{nat_to_limbs, BigNat};
-use crate::traits::Group;
-use bellperson::{
-  gadgets::{
-    boolean::{AllocatedBit, Boolean},
-    num::AllocatedNum,
-    Assignment,
-  },
+use crate::traits::Engine;
+use bellpepper::gadgets::Assignment;
+use bellpepper_core::{
+  boolean::{AllocatedBit, Boolean},
+  num::AllocatedNum,
   ConstraintSystem, LinearCombination, SynthesisError,
 };
 use ff::{Field, PrimeField, PrimeFieldBits};
@@ -15,7 +13,7 @@ use num_bigint::BigInt;
 /// Gets as input the little indian representation of a number and spits out the number
 pub fn le_bits_to_num<Scalar, CS>(
   mut cs: CS,
-  bits: Vec<AllocatedBit>,
+  bits: &[AllocatedBit],
 ) -> Result<AllocatedNum<Scalar>, SynthesisError>
 where
   Scalar: PrimeField + PrimeFieldBits,
@@ -46,24 +44,20 @@ where
 }
 
 /// Allocate a variable that is set to zero
-pub fn alloc_zero<F: PrimeField, CS: ConstraintSystem<F>>(
-  mut cs: CS,
-) -> Result<AllocatedNum<F>, SynthesisError> {
-  let zero = AllocatedNum::alloc(cs.namespace(|| "alloc"), || Ok(F::ZERO))?;
+pub fn alloc_zero<F: PrimeField, CS: ConstraintSystem<F>>(mut cs: CS) -> AllocatedNum<F> {
+  let zero = AllocatedNum::alloc_infallible(cs.namespace(|| "alloc"), || F::ZERO);
   cs.enforce(
     || "check zero is valid",
     |lc| lc,
     |lc| lc,
     |lc| lc + zero.get_variable(),
   );
-  Ok(zero)
+  zero
 }
 
 /// Allocate a variable that is set to one
-pub fn alloc_one<F: PrimeField, CS: ConstraintSystem<F>>(
-  mut cs: CS,
-) -> Result<AllocatedNum<F>, SynthesisError> {
-  let one = AllocatedNum::alloc(cs.namespace(|| "alloc"), || Ok(F::ONE))?;
+pub fn alloc_one<F: PrimeField, CS: ConstraintSystem<F>>(mut cs: CS) -> AllocatedNum<F> {
+  let one = AllocatedNum::alloc_infallible(cs.namespace(|| "alloc"), || F::ONE);
   cs.enforce(
     || "check one is valid",
     |lc| lc + CS::one(),
@@ -71,23 +65,23 @@ pub fn alloc_one<F: PrimeField, CS: ConstraintSystem<F>>(
     |lc| lc + one.get_variable(),
   );
 
-  Ok(one)
+  one
 }
 
 /// Allocate a scalar as a base. Only to be used is the scalar fits in base!
-pub fn alloc_scalar_as_base<G, CS>(
+pub fn alloc_scalar_as_base<E, CS>(
   mut cs: CS,
-  input: Option<G::Scalar>,
-) -> Result<AllocatedNum<G::Base>, SynthesisError>
+  input: Option<E::Scalar>,
+) -> Result<AllocatedNum<E::Base>, SynthesisError>
 where
-  G: Group,
-  <G as Group>::Scalar: PrimeFieldBits,
-  CS: ConstraintSystem<<G as Group>::Base>,
+  E: Engine,
+  <E as Engine>::Scalar: PrimeFieldBits,
+  CS: ConstraintSystem<<E as Engine>::Base>,
 {
   AllocatedNum::alloc(cs.namespace(|| "allocate scalar as base"), || {
-    let input_bits = input.unwrap_or(G::Scalar::ZERO).clone().to_le_bits();
-    let mut mult = G::Base::ONE;
-    let mut val = G::Base::ZERO;
+    let input_bits = input.unwrap_or(E::Scalar::ZERO).clone().to_le_bits();
+    let mut mult = E::Base::ONE;
+    let mut val = E::Base::ZERO;
     for bit in input_bits {
       if bit {
         val += mult;
@@ -99,10 +93,10 @@ where
 }
 
 /// interepret scalar as base
-pub fn scalar_as_base<G: Group>(input: G::Scalar) -> G::Base {
+pub fn scalar_as_base<E: Engine>(input: E::Scalar) -> E::Base {
   let input_bits = input.to_le_bits();
-  let mut mult = G::Base::ONE;
-  let mut val = G::Base::ZERO;
+  let mut mult = E::Base::ONE;
+  let mut val = E::Base::ZERO;
   for bit in input_bits {
     if bit {
       val += mult;
@@ -128,15 +122,14 @@ pub fn alloc_bignat_constant<F: PrimeField, CS: ConstraintSystem<F>>(
     n_limbs,
   )?;
   // Now enforce that the limbs are all equal to the constants
-  #[allow(clippy::needless_range_loop)]
-  for i in 0..n_limbs {
+  (0..n_limbs).for_each(|i| {
     cs.enforce(
       || format!("check limb {i}"),
       |lc| lc + &bignat.limbs[i],
       |lc| lc + CS::one(),
       |lc| lc + (limbs[i], CS::one()),
     );
-  }
+  });
   Ok(bignat)
 }
 
@@ -227,7 +220,7 @@ pub fn conditionally_select_vec<F: PrimeField, CS: ConstraintSystem<F>>(
     .collect::<Result<Vec<AllocatedNum<F>>, SynthesisError>>()
 }
 
-/// If condition return a otherwise b where a and b are BigNats
+/// If condition return a otherwise b where a and b are `BigNats`
 pub fn conditionally_select_bignat<F: PrimeField, CS: ConstraintSystem<F>>(
   mut cs: CS,
   a: &BigNat<F>,
@@ -261,7 +254,7 @@ pub fn conditionally_select_bignat<F: PrimeField, CS: ConstraintSystem<F>>(
   Ok(c)
 }
 
-/// Same as the above but Condition is an AllocatedNum that needs to be
+/// Same as the above but Condition is an `AllocatedNum` that needs to be
 /// 0 or 1. 1 => True, 0 => False
 pub fn conditionally_select2<F: PrimeField, CS: ConstraintSystem<F>>(
   mut cs: CS,

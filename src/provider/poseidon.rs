@@ -1,10 +1,8 @@
 //! Poseidon Constants and Poseidon-based RO used in Nova
-use crate::traits::{ROCircuitTrait, ROConstantsTrait, ROTrait};
-use bellperson::{
-  gadgets::{
-    boolean::{AllocatedBit, Boolean},
-    num::AllocatedNum,
-  },
+use crate::traits::{ROCircuitTrait, ROTrait};
+use bellpepper_core::{
+  boolean::{AllocatedBit, Boolean},
+  num::AllocatedNum,
   ConstraintSystem, SynthesisError,
 };
 use core::marker::PhantomData;
@@ -23,16 +21,12 @@ use neptune::{
 use serde::{Deserialize, Serialize};
 
 /// All Poseidon Constants that are used in Nova
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct PoseidonConstantsCircuit<Scalar: PrimeField>(PoseidonConstants<Scalar, U24>);
 
-impl<Scalar> ROConstantsTrait<Scalar> for PoseidonConstantsCircuit<Scalar>
-where
-  Scalar: PrimeField + PrimeFieldBits,
-{
+impl<Scalar: PrimeField> Default for PoseidonConstantsCircuit<Scalar> {
   /// Generate Poseidon constants
-  #[allow(clippy::new_without_default)]
-  fn new() -> Self {
+  fn default() -> Self {
     Self(Sponge::<Scalar, U24>::api_constants(Strength::Standard))
   }
 }
@@ -41,8 +35,8 @@ where
 #[derive(Serialize, Deserialize)]
 pub struct PoseidonRO<Base, Scalar>
 where
-  Base: PrimeField + PrimeFieldBits,
-  Scalar: PrimeField + PrimeFieldBits,
+  Base: PrimeField,
+  Scalar: PrimeField,
 {
   // Internal State
   state: Vec<Base>,
@@ -55,8 +49,9 @@ where
 impl<Base, Scalar> ROTrait<Base, Scalar> for PoseidonRO<Base, Scalar>
 where
   Base: PrimeField + PrimeFieldBits + Serialize + for<'de> Deserialize<'de>,
-  Scalar: PrimeField + PrimeFieldBits,
+  Scalar: PrimeField,
 {
+  type CircuitRO = PoseidonROCircuit<Base>;
   type Constants = PoseidonConstantsCircuit<Base>;
 
   fn new(constants: PoseidonConstantsCircuit<Base>, num_absorbs: usize) -> Self {
@@ -65,7 +60,7 @@ where
       constants,
       num_absorbs,
       squeezed: false,
-      _p: PhantomData::default(),
+      _p: PhantomData,
     }
   }
 
@@ -110,10 +105,7 @@ where
 
 /// A Poseidon-based RO gadget to use inside the verifier circuit.
 #[derive(Serialize, Deserialize)]
-pub struct PoseidonROCircuit<Scalar>
-where
-  Scalar: PrimeField + PrimeFieldBits,
-{
+pub struct PoseidonROCircuit<Scalar: PrimeField> {
   // Internal state
   state: Vec<AllocatedNum<Scalar>>,
   constants: PoseidonConstantsCircuit<Scalar>,
@@ -125,6 +117,7 @@ impl<Scalar> ROCircuitTrait<Scalar> for PoseidonROCircuit<Scalar>
 where
   Scalar: PrimeField + PrimeFieldBits + Serialize + for<'de> Deserialize<'de>,
 {
+  type NativeRO<T: PrimeField> = PoseidonRO<Scalar, T>;
   type Constants = PoseidonConstantsCircuit<Scalar>;
 
   /// Initialize the internal state and set the poseidon constants
@@ -138,20 +131,17 @@ where
   }
 
   /// Absorb a new number into the state of the oracle
-  fn absorb(&mut self, e: AllocatedNum<Scalar>) {
+  fn absorb(&mut self, e: &AllocatedNum<Scalar>) {
     assert!(!self.squeezed, "Cannot absorb after squeezing");
-    self.state.push(e);
+    self.state.push(e.clone());
   }
 
   /// Compute a challenge by hashing the current state
-  fn squeeze<CS>(
+  fn squeeze<CS: ConstraintSystem<Scalar>>(
     &mut self,
     mut cs: CS,
     num_bits: usize,
-  ) -> Result<Vec<AllocatedBit>, SynthesisError>
-  where
-    CS: ConstraintSystem<Scalar>,
-  {
+  ) -> Result<Vec<AllocatedBit>, SynthesisError> {
     // check if we have squeezed already
     assert!(!self.squeezed, "Cannot squeeze again after squeezing");
     self.squeezed = true;
@@ -201,49 +191,55 @@ where
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::provider::{
+    Bn256EngineKZG, GrumpkinEngine, PallasEngine, Secp256k1Engine, Secq256k1Engine, VestaEngine,
+  };
   use crate::{
-    bellperson::solver::SatisfyingAssignment, constants::NUM_CHALLENGE_BITS,
-    gadgets::utils::le_bits_to_num, traits::Group,
+    bellpepper::solver::SatisfyingAssignment, constants::NUM_CHALLENGE_BITS,
+    gadgets::utils::le_bits_to_num, traits::Engine,
   };
   use ff::Field;
   use rand::rngs::OsRng;
 
-  fn test_poseidon_ro_with<G: Group>()
+  fn test_poseidon_ro_with<E: Engine>()
   where
-    // we can print the field elements we get from G's Base & Scalar fields,
+    // we can print the field elements we get from E's Base & Scalar fields,
     // and compare their byte representations
-    <<G as Group>::Base as PrimeField>::Repr: std::fmt::Debug,
-    <<G as Group>::Scalar as PrimeField>::Repr: std::fmt::Debug,
-    <<G as Group>::Base as PrimeField>::Repr: PartialEq<<<G as Group>::Scalar as PrimeField>::Repr>,
+    <<E as Engine>::Base as PrimeField>::Repr: std::fmt::Debug,
+    <<E as Engine>::Scalar as PrimeField>::Repr: std::fmt::Debug,
+    <<E as Engine>::Base as PrimeField>::Repr:
+      PartialEq<<<E as Engine>::Scalar as PrimeField>::Repr>,
   {
     // Check that the number computed inside the circuit is equal to the number computed outside the circuit
     let mut csprng: OsRng = OsRng;
-    let constants = PoseidonConstantsCircuit::<G::Scalar>::new();
+    let constants = PoseidonConstantsCircuit::<E::Scalar>::default();
     let num_absorbs = 32;
-    let mut ro: PoseidonRO<G::Scalar, G::Base> = PoseidonRO::new(constants.clone(), num_absorbs);
-    let mut ro_gadget: PoseidonROCircuit<G::Scalar> =
+    let mut ro: PoseidonRO<E::Scalar, E::Base> = PoseidonRO::new(constants.clone(), num_absorbs);
+    let mut ro_gadget: PoseidonROCircuit<E::Scalar> =
       PoseidonROCircuit::new(constants, num_absorbs);
-    let mut cs: SatisfyingAssignment<G> = SatisfyingAssignment::new();
+    let mut cs = SatisfyingAssignment::<E>::new();
     for i in 0..num_absorbs {
-      let num = G::Scalar::random(&mut csprng);
+      let num = E::Scalar::random(&mut csprng);
       ro.absorb(num);
-      let num_gadget =
-        AllocatedNum::alloc(cs.namespace(|| format!("data {i}")), || Ok(num)).unwrap();
+      let num_gadget = AllocatedNum::alloc_infallible(cs.namespace(|| format!("data {i}")), || num);
       num_gadget
         .inputize(&mut cs.namespace(|| format!("input {i}")))
         .unwrap();
-      ro_gadget.absorb(num_gadget);
+      ro_gadget.absorb(&num_gadget);
     }
     let num = ro.squeeze(NUM_CHALLENGE_BITS);
     let num2_bits = ro_gadget.squeeze(&mut cs, NUM_CHALLENGE_BITS).unwrap();
-    let num2 = le_bits_to_num(&mut cs, num2_bits).unwrap();
+    let num2 = le_bits_to_num(&mut cs, &num2_bits).unwrap();
     assert_eq!(num.to_repr(), num2.get_value().unwrap().to_repr());
   }
 
   #[test]
   fn test_poseidon_ro() {
-    type G = pasta_curves::pallas::Point;
-
-    test_poseidon_ro_with::<G>()
+    test_poseidon_ro_with::<PallasEngine>();
+    test_poseidon_ro_with::<VestaEngine>();
+    test_poseidon_ro_with::<Bn256EngineKZG>();
+    test_poseidon_ro_with::<GrumpkinEngine>();
+    test_poseidon_ro_with::<Secp256k1Engine>();
+    test_poseidon_ro_with::<Secq256k1Engine>();
   }
 }

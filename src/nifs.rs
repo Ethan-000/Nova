@@ -1,56 +1,57 @@
 //! This module implements a non-interactive folding scheme
 #![allow(non_snake_case)]
-#![allow(clippy::type_complexity)]
 
 use crate::{
   constants::{NUM_CHALLENGE_BITS, NUM_FE_FOR_RO},
   errors::NovaError,
   r1cs::{R1CSInstance, R1CSShape, R1CSWitness, RelaxedR1CSInstance, RelaxedR1CSWitness},
   scalar_as_base,
-  traits::{commitment::CommitmentTrait, AbsorbInROTrait, Group, ROTrait},
+  traits::{commitment::CommitmentTrait, AbsorbInROTrait, Engine, ROTrait},
   Commitment, CommitmentKey, CompressedCommitment,
 };
-use core::marker::PhantomData;
 use serde::{Deserialize, Serialize};
 
 /// A SNARK that holds the proof of a step of an incremental computation
 #[allow(clippy::upper_case_acronyms)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(bound = "")]
-pub struct NIFS<G: Group> {
-  pub(crate) comm_T: CompressedCommitment<G>,
-  _p: PhantomData<G>,
+pub struct NIFS<E: Engine> {
+  pub(crate) comm_T: CompressedCommitment<E>,
 }
 
-type ROConstants<G> =
-  <<G as Group>::RO as ROTrait<<G as Group>::Base, <G as Group>::Scalar>>::Constants;
+type ROConstants<E> =
+  <<E as Engine>::RO as ROTrait<<E as Engine>::Base, <E as Engine>::Scalar>>::Constants;
 
-impl<G: Group> NIFS<G> {
+impl<E: Engine> NIFS<E> {
   /// Takes as input a Relaxed R1CS instance-witness tuple `(U1, W1)` and
   /// an R1CS instance-witness tuple `(U2, W2)` with the same structure `shape`
   /// and defined with respect to the same `ck`, and outputs
   /// a folded Relaxed R1CS instance-witness tuple `(U, W)` of the same shape `shape`,
   /// with the guarantee that the folded witness `W` satisfies the folded instance `U`
   /// if and only if `W1` satisfies `U1` and `W2` satisfies `U2`.
-  #[allow(clippy::too_many_arguments)]
+  ///
+  /// Note that this code is tailored for use with Nova's IVC scheme, which enforces
+  /// certain requirements between the two instances that are folded.
+  /// In particular, it requires that `U1` and `U2` are such that the hash of `U1` is stored in the public IO of `U2`.
+  /// In this particular setting, this means that if `U2` is absorbed in the RO, it implicitly absorbs `U1` as well.
+  /// So the code below avoids absorbing `U1` in the RO.
   pub fn prove(
-    ck: &CommitmentKey<G>,
-    ro_consts: &ROConstants<G>,
-    pp_digest: &G::Scalar,
-    S: &R1CSShape<G>,
-    U1: &RelaxedR1CSInstance<G>,
-    W1: &RelaxedR1CSWitness<G>,
-    U2: &R1CSInstance<G>,
-    W2: &R1CSWitness<G>,
-  ) -> Result<(NIFS<G>, (RelaxedR1CSInstance<G>, RelaxedR1CSWitness<G>)), NovaError> {
+    ck: &CommitmentKey<E>,
+    ro_consts: &ROConstants<E>,
+    pp_digest: &E::Scalar,
+    S: &R1CSShape<E>,
+    U1: &RelaxedR1CSInstance<E>,
+    W1: &RelaxedR1CSWitness<E>,
+    U2: &R1CSInstance<E>,
+    W2: &R1CSWitness<E>,
+  ) -> Result<(NIFS<E>, (RelaxedR1CSInstance<E>, RelaxedR1CSWitness<E>)), NovaError> {
     // initialize a new RO
-    let mut ro = G::RO::new(ro_consts.clone(), NUM_FE_FOR_RO);
+    let mut ro = E::RO::new(ro_consts.clone(), NUM_FE_FOR_RO);
 
     // append the digest of pp to the transcript
-    ro.absorb(scalar_as_base::<G>(*pp_digest));
+    ro.absorb(scalar_as_base::<E>(*pp_digest));
 
-    // append U1 and U2 to transcript
-    U1.absorb_in_ro(&mut ro);
+    // append U2 to transcript, U1 does not need to absorbed since U2.X[0] = Hash(params, U1, i, z0, zi)
     U2.absorb_in_ro(&mut ro);
 
     // compute a commitment to the cross-term
@@ -63,7 +64,7 @@ impl<G: Group> NIFS<G> {
     let r = ro.squeeze(NUM_CHALLENGE_BITS);
 
     // fold the instance using `r` and `comm_T`
-    let U = U1.fold(U2, &comm_T, &r)?;
+    let U = U1.fold(U2, &comm_T, &r);
 
     // fold the witness using `r` and `T`
     let W = W1.fold(W2, &T, &r)?;
@@ -72,43 +73,41 @@ impl<G: Group> NIFS<G> {
     Ok((
       Self {
         comm_T: comm_T.compress(),
-        _p: Default::default(),
       },
       (U, W),
     ))
   }
 
-  /// Takes as input a relaxed R1CS instance `U1` and and R1CS instance `U2`
+  /// Takes as input a relaxed R1CS instance `U1` and R1CS instance `U2`
   /// with the same shape and defined with respect to the same parameters,
   /// and outputs a folded instance `U` with the same shape,
   /// with the guarantee that the folded instance `U`
   /// if and only if `U1` and `U2` are satisfiable.
   pub fn verify(
     &self,
-    ro_consts: &ROConstants<G>,
-    pp_digest: &G::Scalar,
-    U1: &RelaxedR1CSInstance<G>,
-    U2: &R1CSInstance<G>,
-  ) -> Result<RelaxedR1CSInstance<G>, NovaError> {
+    ro_consts: &ROConstants<E>,
+    pp_digest: &E::Scalar,
+    U1: &RelaxedR1CSInstance<E>,
+    U2: &R1CSInstance<E>,
+  ) -> Result<RelaxedR1CSInstance<E>, NovaError> {
     // initialize a new RO
-    let mut ro = G::RO::new(ro_consts.clone(), NUM_FE_FOR_RO);
+    let mut ro = E::RO::new(ro_consts.clone(), NUM_FE_FOR_RO);
 
     // append the digest of pp to the transcript
-    ro.absorb(scalar_as_base::<G>(*pp_digest));
+    ro.absorb(scalar_as_base::<E>(*pp_digest));
 
-    // append U1 and U2 to transcript
-    U1.absorb_in_ro(&mut ro);
+    // append U2 to transcript, U1 does not need to absorbed since U2.X[0] = Hash(params, U1, i, z0, zi)
     U2.absorb_in_ro(&mut ro);
 
     // append `comm_T` to the transcript and obtain a challenge
-    let comm_T = Commitment::<G>::decompress(&self.comm_T)?;
+    let comm_T = Commitment::<E>::decompress(&self.comm_T)?;
     comm_T.absorb_in_ro(&mut ro);
 
     // compute a challenge from the RO
     let r = ro.squeeze(NUM_CHALLENGE_BITS);
 
     // fold the instance using `r` and `comm_T`
-    let U = U1.fold(U2, &comm_T, &r)?;
+    let U = U1.fold(U2, &comm_T, &r);
 
     // return the folded instance
     Ok(U)
@@ -119,22 +118,25 @@ impl<G: Group> NIFS<G> {
 mod tests {
   use super::*;
   use crate::{
-    r1cs::R1CS,
-    traits::{Group, ROConstantsTrait},
+    bellpepper::{
+      r1cs::{NovaShape, NovaWitness},
+      solver::SatisfyingAssignment,
+      test_shape_cs::TestShapeCS,
+    },
+    provider::{Bn256EngineKZG, PallasEngine, Secp256k1Engine},
+    r1cs::{SparseMatrix, R1CS},
+    traits::{snark::default_ck_hint, Engine},
   };
-  use ::bellperson::{gadgets::num::AllocatedNum, ConstraintSystem, SynthesisError};
+  use ::bellpepper_core::{num::AllocatedNum, ConstraintSystem, SynthesisError};
   use ff::{Field, PrimeField};
   use rand::rngs::OsRng;
 
-  type S = pasta_curves::pallas::Scalar;
-  type G = pasta_curves::pallas::Point;
-
-  fn synthesize_tiny_r1cs_bellperson<Scalar: PrimeField, CS: ConstraintSystem<Scalar>>(
+  fn synthesize_tiny_r1cs_bellpepper<Scalar: PrimeField, CS: ConstraintSystem<Scalar>>(
     cs: &mut CS,
     x_val: Option<Scalar>,
   ) -> Result<(), SynthesisError> {
     // Consider a cubic equation: `x^3 + x + 5 = y`, where `x` and `y` are respectively the input and output.
-    let x = AllocatedNum::alloc(cs.namespace(|| "x"), || Ok(x_val.unwrap()))?;
+    let x = AllocatedNum::alloc_infallible(cs.namespace(|| "x"), || x_val.unwrap());
     let _ = x.inputize(cs.namespace(|| "x is input"));
 
     let x_sq = x.square(cs.namespace(|| "x_sq"))?;
@@ -162,34 +164,25 @@ mod tests {
     Ok(())
   }
 
-  fn test_tiny_r1cs_bellperson_with<G>()
-  where
-    G: Group,
-  {
-    use crate::bellperson::{
-      r1cs::{NovaShape, NovaWitness},
-      shape_cs::ShapeCS,
-      solver::SatisfyingAssignment,
-    };
-
+  fn test_tiny_r1cs_bellpepper_with<E: Engine>() {
     // First create the shape
-    let mut cs: ShapeCS<G> = ShapeCS::new();
-    let _ = synthesize_tiny_r1cs_bellperson(&mut cs, None);
-    let (shape, ck) = cs.r1cs_shape();
+    let mut cs: TestShapeCS<E> = TestShapeCS::new();
+    let _ = synthesize_tiny_r1cs_bellpepper(&mut cs, None);
+    let (shape, ck) = cs.r1cs_shape(&*default_ck_hint());
     let ro_consts =
-      <<G as Group>::RO as ROTrait<<G as Group>::Base, <G as Group>::Scalar>>::Constants::new();
+      <<E as Engine>::RO as ROTrait<<E as Engine>::Base, <E as Engine>::Scalar>>::Constants::default();
 
     // Now get the instance and assignment for one instance
-    let mut cs: SatisfyingAssignment<G> = SatisfyingAssignment::new();
-    let _ = synthesize_tiny_r1cs_bellperson(&mut cs, Some(G::Scalar::from(5)));
+    let mut cs = SatisfyingAssignment::<E>::new();
+    let _ = synthesize_tiny_r1cs_bellpepper(&mut cs, Some(E::Scalar::from(5)));
     let (U1, W1) = cs.r1cs_instance_and_witness(&shape, &ck).unwrap();
 
     // Make sure that the first instance is satisfiable
     assert!(shape.is_sat(&ck, &U1, &W1).is_ok());
 
     // Now get the instance and assignment for second instance
-    let mut cs: SatisfyingAssignment<G> = SatisfyingAssignment::new();
-    let _ = synthesize_tiny_r1cs_bellperson(&mut cs, Some(G::Scalar::from(135)));
+    let mut cs = SatisfyingAssignment::<E>::new();
+    let _ = synthesize_tiny_r1cs_bellpepper(&mut cs, Some(E::Scalar::from(135)));
     let (U2, W2) = cs.r1cs_instance_and_witness(&shape, &ck).unwrap();
 
     // Make sure that the second instance is satisfiable
@@ -199,7 +192,7 @@ mod tests {
     execute_sequence(
       &ck,
       &ro_consts,
-      &<G as Group>::Scalar::ZERO,
+      &<E as Engine>::Scalar::ZERO,
       &shape,
       &U1,
       &W1,
@@ -209,23 +202,22 @@ mod tests {
   }
 
   #[test]
-  fn test_tiny_r1cs_bellperson() {
-    test_tiny_r1cs_bellperson_with::<G>();
+  fn test_tiny_r1cs_bellpepper() {
+    test_tiny_r1cs_bellpepper_with::<PallasEngine>();
+    test_tiny_r1cs_bellpepper_with::<Bn256EngineKZG>();
+    test_tiny_r1cs_bellpepper_with::<Secp256k1Engine>();
   }
 
-  #[allow(clippy::too_many_arguments)]
-  fn execute_sequence<G>(
-    ck: &CommitmentKey<G>,
-    ro_consts: &<<G as Group>::RO as ROTrait<<G as Group>::Base, <G as Group>::Scalar>>::Constants,
-    pp_digest: &<G as Group>::Scalar,
-    shape: &R1CSShape<G>,
-    U1: &R1CSInstance<G>,
-    W1: &R1CSWitness<G>,
-    U2: &R1CSInstance<G>,
-    W2: &R1CSWitness<G>,
-  ) where
-    G: Group,
-  {
+  fn execute_sequence<E: Engine>(
+    ck: &CommitmentKey<E>,
+    ro_consts: &<<E as Engine>::RO as ROTrait<<E as Engine>::Base, <E as Engine>::Scalar>>::Constants,
+    pp_digest: &<E as Engine>::Scalar,
+    shape: &R1CSShape<E>,
+    U1: &R1CSInstance<E>,
+    W1: &R1CSWitness<E>,
+    U2: &R1CSInstance<E>,
+    W2: &R1CSWitness<E>,
+  ) {
     // produce a default running instance
     let mut r_W = RelaxedR1CSWitness::default(shape);
     let mut r_U = RelaxedR1CSInstance::default(ck, shape);
@@ -266,12 +258,11 @@ mod tests {
     assert!(shape.is_sat_relaxed(ck, &r_U, &r_W).is_ok());
   }
 
-  #[test]
-  fn test_tiny_r1cs() {
-    let one = S::one();
+  fn test_tiny_r1cs_with<E: Engine>() {
+    let one = <E::Scalar as Field>::ONE;
     let (num_cons, num_vars, num_io, A, B, C) = {
       let num_cons = 4;
-      let num_vars = 4;
+      let num_vars = 3;
       let num_io = 2;
 
       // Consider a cubic equation: `x^3 + x + 5 = y`, where `x` and `y` are respectively the input and output.
@@ -285,9 +276,9 @@ mod tests {
       // constraint and a column for every entry in z = (vars, u, inputs)
       // An R1CS instance is satisfiable iff:
       // Az \circ Bz = u \cdot Cz + E, where z = (vars, 1, inputs)
-      let mut A: Vec<(usize, usize, S)> = Vec::new();
-      let mut B: Vec<(usize, usize, S)> = Vec::new();
-      let mut C: Vec<(usize, usize, S)> = Vec::new();
+      let mut A: Vec<(usize, usize, E::Scalar)> = Vec::new();
+      let mut B: Vec<(usize, usize, E::Scalar)> = Vec::new();
+      let mut C: Vec<(usize, usize, E::Scalar)> = Vec::new();
 
       // constraint 0 entries in (A,B,C)
       // `I0 * I0 - Z0 = 0`
@@ -319,19 +310,29 @@ mod tests {
     };
 
     // create a shape object
+    let rows = num_cons;
+    let num_inputs = num_io + 1;
+    let cols = num_vars + num_inputs;
     let S = {
-      let res = R1CSShape::new(num_cons, num_vars, num_io, &A, &B, &C);
+      let res = R1CSShape::new(
+        num_cons,
+        num_vars,
+        num_inputs - 1,
+        SparseMatrix::new(&A, rows, cols),
+        SparseMatrix::new(&B, rows, cols),
+        SparseMatrix::new(&C, rows, cols),
+      );
       assert!(res.is_ok());
       res.unwrap()
     };
 
     // generate generators and ro constants
-    let ck = R1CS::<G>::commitment_key(&S);
+    let ck = R1CS::<E>::commitment_key(&S, &*default_ck_hint());
     let ro_consts =
-      <<G as Group>::RO as ROTrait<<G as Group>::Base, <G as Group>::Scalar>>::Constants::new();
+      <<E as Engine>::RO as ROTrait<<E as Engine>::Base, <E as Engine>::Scalar>>::Constants::default();
 
     let rand_inst_witness_generator =
-      |ck: &CommitmentKey<G>, I: &S| -> (S, R1CSInstance<G>, R1CSWitness<G>) {
+      |ck: &CommitmentKey<E>, I: &E::Scalar| -> (E::Scalar, R1CSInstance<E>, R1CSWitness<E>) {
         let i0 = *I;
 
         // compute a satisfying (vars, X) tuple
@@ -342,7 +343,7 @@ mod tests {
           let i1 = z2 + one + one + one + one + one; // constraint 3
 
           // store the witness and IO for the instance
-          let W = vec![z0, z1, z2, S::zero()];
+          let W = vec![z0, z1, z2];
           let X = vec![i0, i1];
           (i1, W, X)
         };
@@ -366,7 +367,7 @@ mod tests {
       };
 
     let mut csprng: OsRng = OsRng;
-    let I = S::random(&mut csprng); // the first input is picked randomly for the first instance
+    let I = E::Scalar::random(&mut csprng); // the first input is picked randomly for the first instance
     let (O, U1, W1) = rand_inst_witness_generator(&ck, &I);
     let (_O, U2, W2) = rand_inst_witness_generator(&ck, &O);
 
@@ -374,12 +375,19 @@ mod tests {
     execute_sequence(
       &ck,
       &ro_consts,
-      &<G as Group>::Scalar::ZERO,
+      &<E as Engine>::Scalar::ZERO,
       &S,
       &U1,
       &W1,
       &U2,
       &W2,
     );
+  }
+
+  #[test]
+  fn test_tiny_r1cs() {
+    test_tiny_r1cs_with::<PallasEngine>();
+    test_tiny_r1cs_with::<Bn256EngineKZG>();
+    test_tiny_r1cs_with::<Secp256k1Engine>();
   }
 }

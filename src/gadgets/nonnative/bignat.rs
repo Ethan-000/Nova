@@ -4,7 +4,7 @@ use super::{
   },
   OptionExt,
 };
-use bellperson::{ConstraintSystem, LinearCombination, SynthesisError};
+use bellpepper_core::{ConstraintSystem, LinearCombination, SynthesisError};
 use ff::PrimeField;
 use num_bigint::BigInt;
 use num_traits::cast::ToPrimitive;
@@ -91,12 +91,12 @@ pub struct BigNat<Scalar: PrimeField> {
   pub params: BigNatParams,
 }
 
-impl<Scalar: PrimeField> std::cmp::PartialEq for BigNat<Scalar> {
+impl<Scalar: PrimeField> PartialEq for BigNat<Scalar> {
   fn eq(&self, other: &Self) -> bool {
     self.value == other.value && self.params == other.params
   }
 }
-impl<Scalar: PrimeField> std::cmp::Eq for BigNat<Scalar> {}
+impl<Scalar: PrimeField> Eq for BigNat<Scalar> {}
 
 impl<Scalar: PrimeField> From<BigNat<Scalar>> for Polynomial<Scalar> {
   fn from(other: BigNat<Scalar>) -> Polynomial<Scalar> {
@@ -167,7 +167,7 @@ impl<Scalar: PrimeField> BigNat<Scalar> {
   }
 
   /// Allocates a `BigNat` in the circuit with `n_limbs` limbs of width `limb_width` each.
-  /// The `max_word` is gauranteed to be `(2 << limb_width) - 1`.
+  /// The `max_word` is guaranteed to be `(2 << limb_width) - 1`.
   /// The value is provided by a closure returning a natural number.
   pub fn alloc_from_nat<CS, F>(
     mut cs: CS,
@@ -218,11 +218,11 @@ impl<Scalar: PrimeField> BigNat<Scalar> {
   }
 
   /// Allocates a `BigNat` in the circuit with `n_limbs` limbs of width `limb_width` each.
-  /// The `max_word` is gauranteed to be `(2 << limb_width) - 1`.
+  /// The `max_word` is guaranteed to be `(2 << limb_width) - 1`.
   /// The value is provided by an allocated number
   pub fn from_num<CS: ConstraintSystem<Scalar>>(
     mut cs: CS,
-    n: Num<Scalar>,
+    n: &Num<Scalar>,
     limb_width: usize,
     n_limbs: usize,
   ) -> Result<Self, SynthesisError> {
@@ -244,7 +244,7 @@ impl<Scalar: PrimeField> BigNat<Scalar> {
     // (1) decompose `bignat` into a bitvector `bv`
     let bv = bignat.decompose(cs.namespace(|| "bv"))?;
     // (2) recompose bits and check if it equals n
-    n.is_equal(cs.namespace(|| "n"), &bv)?;
+    n.is_equal(cs.namespace(|| "n"), &bv);
 
     Ok(bignat)
   }
@@ -360,7 +360,7 @@ impl<Scalar: PrimeField> BigNat<Scalar> {
     let n = min(self.limbs.len(), other.limbs.len());
     let target_base = BigInt::from(1u8) << self.params.limb_width as u32;
     let mut accumulated_extra = BigInt::from(0usize);
-    let max_word = std::cmp::max(&self.params.max_word, &other.params.max_word);
+    let max_word = max(&self.params.max_word, &other.params.max_word);
     let carry_bits = (((max_word.to_f64().unwrap() * 2.0).log2() - self.params.limb_width as f64)
       .ceil()
       + 0.1) as usize;
@@ -439,7 +439,7 @@ impl<Scalar: PrimeField> BigNat<Scalar> {
     other: &Self,
   ) -> Result<(), SynthesisError> {
     self.enforce_limb_width_agreement(other, "equal_when_carried_regroup")?;
-    let max_word = std::cmp::max(&self.params.max_word, &other.params.max_word);
+    let max_word = max(&self.params.max_word, &other.params.max_word);
     let carry_bits = (((max_word.to_f64().unwrap() * 2.0).log2() - self.params.limb_width as f64)
       .ceil()
       + 0.1) as usize;
@@ -470,8 +470,7 @@ impl<Scalar: PrimeField> BigNat<Scalar> {
               t.add_assign(b);
               t
             }
-            (Some(a), None) => *a,
-            (None, Some(a)) => *a,
+            (Some(a), None) | (None, Some(a)) => *a,
             (None, None) => unreachable!(),
           })
           .collect()
@@ -552,7 +551,7 @@ impl<Scalar: PrimeField> BigNat<Scalar> {
       x
     };
     let right_max_word = {
-      let mut x = BigInt::from(std::cmp::min(quotient.limbs.len(), modulus.limbs.len()));
+      let mut x = BigInt::from(min(quotient.limbs.len(), modulus.limbs.len()));
       x *= &quotient.params.max_word;
       x *= &modulus.params.max_word;
       x += &remainder.params.max_word;
@@ -598,7 +597,7 @@ impl<Scalar: PrimeField> BigNat<Scalar> {
     let right = right_product.sum(&r_poly);
 
     let right_max_word = {
-      let mut x = BigInt::from(std::cmp::min(quotient.limbs.len(), modulus.limbs.len()));
+      let mut x = BigInt::from(min(quotient.limbs.len(), modulus.limbs.len()));
       x *= &quotient.params.max_word;
       x *= &modulus.params.max_word;
       x += &remainder.params.max_word;
@@ -783,7 +782,9 @@ impl<Scalar: PrimeField> Polynomial<Scalar> {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use bellperson::Circuit;
+  use bellpepper_core::{test_cs::TestConstraintSystem, Circuit};
+  use pasta_curves::pallas::Scalar;
+  use proptest::prelude::*;
 
   pub struct PolynomialMultiplier<Scalar: PrimeField> {
     pub a: Vec<Scalar>,
@@ -816,6 +817,81 @@ mod tests {
       };
       let _prod = a.alloc_product(cs.namespace(|| "product"), &b)?;
       Ok(())
+    }
+  }
+
+  #[test]
+  fn test_polynomial_multiplier_circuit() {
+    let mut cs = TestConstraintSystem::<Scalar>::new();
+
+    let circuit = PolynomialMultiplier {
+      a: [1, 1, 1].iter().map(|i| Scalar::from_u128(*i)).collect(),
+      b: [1, 1].iter().map(|i| Scalar::from_u128(*i)).collect(),
+    };
+
+    circuit.synthesize(&mut cs).expect("synthesis failed");
+
+    if let Some(token) = cs.which_is_unsatisfied() {
+      eprintln!("Error: {} is unsatisfied", token);
+    }
+  }
+
+  #[derive(Debug)]
+  pub struct BigNatBitDecompInputs {
+    pub n: BigInt,
+  }
+
+  pub struct BigNatBitDecompParams {
+    pub limb_width: usize,
+    pub n_limbs: usize,
+  }
+
+  pub struct BigNatBitDecomp {
+    inputs: Option<BigNatBitDecompInputs>,
+    params: BigNatBitDecompParams,
+  }
+
+  impl<Scalar: PrimeField> Circuit<Scalar> for BigNatBitDecomp {
+    fn synthesize<CS: ConstraintSystem<Scalar>>(self, cs: &mut CS) -> Result<(), SynthesisError> {
+      let n = BigNat::alloc_from_nat(
+        cs.namespace(|| "n"),
+        || Ok(self.inputs.grab()?.n.clone()),
+        self.params.limb_width,
+        self.params.n_limbs,
+      )?;
+      n.decompose(cs.namespace(|| "decomp"))?;
+      Ok(())
+    }
+  }
+
+  proptest! {
+
+    #![proptest_config(ProptestConfig {
+      cases: 10, // this test is costlier as max n gets larger
+      .. ProptestConfig::default()
+    })]
+    #[test]
+    fn test_big_nat_can_decompose(n in any::<u16>(), limb_width in 40u8..200) {
+        let n = n as usize;
+
+        let n_limbs = if n == 0 {
+            1
+        } else {
+            (n - 1) / limb_width as usize + 1
+        };
+
+        let circuit = BigNatBitDecomp {
+           inputs: Some(BigNatBitDecompInputs {
+                n: BigInt::from(n),
+            }),
+            params: BigNatBitDecompParams {
+                limb_width: limb_width as usize,
+                n_limbs,
+            },
+        };
+        let mut cs = TestConstraintSystem::<Scalar>::new();
+        circuit.synthesize(&mut cs).expect("synthesis failed");
+        prop_assert!(cs.is_satisfied());
     }
   }
 }

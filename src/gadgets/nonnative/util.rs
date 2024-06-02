@@ -1,6 +1,6 @@
 use super::{BitAccess, OptionExt};
-use bellperson::{
-  gadgets::num::AllocatedNum,
+use bellpepper_core::{
+  num::AllocatedNum,
   {ConstraintSystem, LinearCombination, SynthesisError, Variable},
 };
 use byteorder::WriteBytesExt;
@@ -32,10 +32,10 @@ pub struct Bitvector<Scalar: PrimeField> {
 impl<Scalar: PrimeField> Bit<Scalar> {
   /// Allocate a variable in the constraint system which can only be a
   /// boolean value.
-  pub fn alloc<CS>(mut cs: CS, value: Option<bool>) -> Result<Self, SynthesisError>
-  where
-    CS: ConstraintSystem<Scalar>,
-  {
+  pub fn alloc<CS: ConstraintSystem<Scalar>>(
+    mut cs: CS,
+    value: Option<bool>,
+  ) -> Result<Self, SynthesisError> {
     let var = cs.alloc(
       || "boolean",
       || {
@@ -69,7 +69,7 @@ pub struct Num<Scalar: PrimeField> {
 }
 
 impl<Scalar: PrimeField> Num<Scalar> {
-  pub fn new(value: Option<Scalar>, num: LinearCombination<Scalar>) -> Self {
+  pub const fn new(value: Option<Scalar>, num: LinearCombination<Scalar>) -> Self {
     Self { value, num }
   }
   pub fn alloc<CS, F>(mut cs: CS, value: F) -> Result<Self, SynthesisError>
@@ -157,11 +157,7 @@ impl<Scalar: PrimeField> Num<Scalar> {
 
   /// Computes the natural number represented by an array of bits.
   /// Checks if the natural number equals `self`
-  pub fn is_equal<CS: ConstraintSystem<Scalar>>(
-    &self,
-    mut cs: CS,
-    other: &Bitvector<Scalar>,
-  ) -> Result<(), SynthesisError> {
+  pub fn is_equal<CS: ConstraintSystem<Scalar>>(&self, mut cs: CS, other: &Bitvector<Scalar>) {
     let allocations = other.allocations.clone();
     let mut f = Scalar::ONE;
     let sum = allocations
@@ -173,7 +169,6 @@ impl<Scalar: PrimeField> Num<Scalar> {
       });
     let sum_lc = LinearCombination::zero() + &self.num - &sum;
     cs.enforce(|| "sum", |lc| lc + &sum_lc, |lc| lc + CS::one(), |lc| lc);
-    Ok(())
   }
 
   /// Compute the natural number represented by an array of limbs.

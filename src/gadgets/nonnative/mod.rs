@@ -1,20 +1,16 @@
 //! This module implements various gadgets necessary for doing non-native arithmetic
 //! Code in this module is adapted from [bellman-bignat](https://github.com/alex-ozdemir/bellman-bignat), which is licenced under MIT
 
-use bellperson::SynthesisError;
+use bellpepper_core::SynthesisError;
 use ff::PrimeField;
 
 trait OptionExt<T> {
   fn grab(&self) -> Result<&T, SynthesisError>;
-  fn grab_mut(&mut self) -> Result<&mut T, SynthesisError>;
 }
 
 impl<T> OptionExt<T> for Option<T> {
   fn grab(&self) -> Result<&T, SynthesisError> {
     self.as_ref().ok_or(SynthesisError::AssignmentMissing)
-  }
-  fn grab_mut(&mut self) -> Result<&mut T, SynthesisError> {
-    self.as_mut().ok_or(SynthesisError::AssignmentMissing)
   }
 }
 

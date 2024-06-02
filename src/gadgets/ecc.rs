@@ -6,53 +6,45 @@ use crate::{
     select_num_or_one, select_num_or_zero, select_num_or_zero2, select_one_or_diff2,
     select_one_or_num2, select_zero_or_num2,
   },
-  traits::Group,
+  traits::{Engine, Group},
 };
-use bellperson::{
-  gadgets::{
-    boolean::{AllocatedBit, Boolean},
-    num::AllocatedNum,
-    Assignment,
-  },
+use bellpepper::gadgets::Assignment;
+use bellpepper_core::{
+  boolean::{AllocatedBit, Boolean},
+  num::AllocatedNum,
   ConstraintSystem, SynthesisError,
 };
 use ff::{Field, PrimeField};
 
-/// AllocatedPoint provides an elliptic curve abstraction inside a circuit.
+/// `AllocatedPoint` provides an elliptic curve abstraction inside a circuit.
 #[derive(Clone)]
-pub struct AllocatedPoint<G>
-where
-  G: Group,
-{
-  pub(crate) x: AllocatedNum<G::Base>,
-  pub(crate) y: AllocatedNum<G::Base>,
-  pub(crate) is_infinity: AllocatedNum<G::Base>,
+pub struct AllocatedPoint<E: Engine> {
+  pub(crate) x: AllocatedNum<E::Base>,
+  pub(crate) y: AllocatedNum<E::Base>,
+  pub(crate) is_infinity: AllocatedNum<E::Base>,
 }
 
-impl<G> AllocatedPoint<G>
+impl<E> AllocatedPoint<E>
 where
-  G: Group,
+  E: Engine,
 {
   /// Allocates a new point on the curve using coordinates provided by `coords`.
   /// If coords = None, it allocates the default infinity point
-  pub fn alloc<CS>(
+  pub fn alloc<CS: ConstraintSystem<E::Base>>(
     mut cs: CS,
-    coords: Option<(G::Base, G::Base, bool)>,
-  ) -> Result<Self, SynthesisError>
-  where
-    CS: ConstraintSystem<G::Base>,
-  {
+    coords: Option<(E::Base, E::Base, bool)>,
+  ) -> Result<Self, SynthesisError> {
     let x = AllocatedNum::alloc(cs.namespace(|| "x"), || {
-      Ok(coords.map_or(G::Base::ZERO, |c| c.0))
+      Ok(coords.map_or(E::Base::ZERO, |c| c.0))
     })?;
     let y = AllocatedNum::alloc(cs.namespace(|| "y"), || {
-      Ok(coords.map_or(G::Base::ZERO, |c| c.1))
+      Ok(coords.map_or(E::Base::ZERO, |c| c.1))
     })?;
     let is_infinity = AllocatedNum::alloc(cs.namespace(|| "is_infinity"), || {
       Ok(if coords.map_or(true, |c| c.2) {
-        G::Base::ONE
+        E::Base::ONE
       } else {
-        G::Base::ZERO
+        E::Base::ZERO
       })
     })?;
     cs.enforce(
@@ -65,13 +57,56 @@ where
     Ok(AllocatedPoint { x, y, is_infinity })
   }
 
-  /// Allocates a default point on the curve.
-  pub fn default<CS>(mut cs: CS) -> Result<Self, SynthesisError>
+  /// checks if `self` is on the curve or if it is infinity
+  pub fn check_on_curve<CS>(&self, mut cs: CS) -> Result<(), SynthesisError>
   where
-    CS: ConstraintSystem<G::Base>,
+    CS: ConstraintSystem<E::Base>,
   {
-    let zero = alloc_zero(cs.namespace(|| "zero"))?;
-    let one = alloc_one(cs.namespace(|| "one"))?;
+    // check that (x,y) is on the curve if it is not infinity
+    // we will check that (1- is_infinity) * y^2 = (1-is_infinity) * (x^3 + Ax + B)
+    // note that is_infinity is already restricted to be in the set {0, 1}
+    let y_square = self.y.square(cs.namespace(|| "y_square"))?;
+    let x_square = self.x.square(cs.namespace(|| "x_square"))?;
+    let x_cube = self.x.mul(cs.namespace(|| "x_cube"), &x_square)?;
+
+    let rhs = AllocatedNum::alloc(cs.namespace(|| "rhs"), || {
+      if *self.is_infinity.get_value().get()? == E::Base::ONE {
+        Ok(E::Base::ZERO)
+      } else {
+        Ok(
+          *x_cube.get_value().get()?
+            + *self.x.get_value().get()? * E::GE::group_params().0
+            + E::GE::group_params().1,
+        )
+      }
+    })?;
+
+    cs.enforce(
+      || "rhs = (1-is_infinity) * (x^3 + Ax + B)",
+      |lc| {
+        lc + x_cube.get_variable()
+          + (E::GE::group_params().0, self.x.get_variable())
+          + (E::GE::group_params().1, CS::one())
+      },
+      |lc| lc + CS::one() - self.is_infinity.get_variable(),
+      |lc| lc + rhs.get_variable(),
+    );
+
+    // check that (1-infinity) * y_square = rhs
+    cs.enforce(
+      || "check that y_square * (1 - is_infinity) = rhs",
+      |lc| lc + y_square.get_variable(),
+      |lc| lc + CS::one() - self.is_infinity.get_variable(),
+      |lc| lc + rhs.get_variable(),
+    );
+
+    Ok(())
+  }
+
+  /// Allocates a default point on the curve, set to the identity point.
+  pub fn default<CS: ConstraintSystem<E::Base>>(mut cs: CS) -> Result<Self, SynthesisError> {
+    let zero = alloc_zero(cs.namespace(|| "zero"));
+    let one = alloc_one(cs.namespace(|| "one"));
 
     Ok(AllocatedPoint {
       x: zero.clone(),
@@ -81,18 +116,18 @@ where
   }
 
   /// Returns coordinates associated with the point.
-  pub fn get_coordinates(
+  pub const fn get_coordinates(
     &self,
   ) -> (
-    &AllocatedNum<G::Base>,
-    &AllocatedNum<G::Base>,
-    &AllocatedNum<G::Base>,
+    &AllocatedNum<E::Base>,
+    &AllocatedNum<E::Base>,
+    &AllocatedNum<E::Base>,
   ) {
     (&self.x, &self.y, &self.is_infinity)
   }
 
   /// Negates the provided point
-  pub fn negate<CS: ConstraintSystem<G::Base>>(&self, mut cs: CS) -> Result<Self, SynthesisError> {
+  pub fn negate<CS: ConstraintSystem<E::Base>>(&self, mut cs: CS) -> Result<Self, SynthesisError> {
     let y = AllocatedNum::alloc(cs.namespace(|| "y"), || Ok(-*self.y.get_value().get()?))?;
 
     cs.enforce(
@@ -110,10 +145,10 @@ where
   }
 
   /// Add two points (may be equal)
-  pub fn add<CS: ConstraintSystem<G::Base>>(
+  pub fn add<CS: ConstraintSystem<E::Base>>(
     &self,
     mut cs: CS,
-    other: &AllocatedPoint<G>,
+    other: &AllocatedPoint<E>,
   ) -> Result<Self, SynthesisError> {
     // Compute boolean equal indicating if self = other
 
@@ -158,11 +193,11 @@ where
   }
 
   /// Adds other point to this point and returns the result. Assumes that the two points are
-  /// different and that both other.is_infinity and this.is_infinty are bits
-  pub fn add_internal<CS: ConstraintSystem<G::Base>>(
+  /// different and that both `other.is_infinity` and `this.is_infinity` are bits
+  pub fn add_internal<CS: ConstraintSystem<E::Base>>(
     &self,
     mut cs: CS,
-    other: &AllocatedPoint<G>,
+    other: &AllocatedPoint<E>,
     equal_x: &AllocatedBit,
   ) -> Result<Self, SynthesisError> {
     //************************************************************************/
@@ -177,9 +212,9 @@ where
     // NOT(NOT(self.is_ifninity) AND NOT(other.is_infinity))
     let at_least_one_inf = AllocatedNum::alloc(cs.namespace(|| "at least one inf"), || {
       Ok(
-        G::Base::ONE
-          - (G::Base::ONE - *self.is_infinity.get_value().get()?)
-            * (G::Base::ONE - *other.is_infinity.get_value().get()?),
+        E::Base::ONE
+          - (E::Base::ONE - *self.is_infinity.get_value().get()?)
+            * (E::Base::ONE - *other.is_infinity.get_value().get()?),
       )
     })?;
     cs.enforce(
@@ -193,7 +228,7 @@ where
     let x_diff_is_actual =
       AllocatedNum::alloc(cs.namespace(|| "allocate x_diff_is_actual"), || {
         Ok(if *equal_x.get_value().get()? {
-          G::Base::ONE
+          E::Base::ONE
         } else {
           *at_least_one_inf.get_value().get()?
         })
@@ -215,9 +250,9 @@ where
     )?;
 
     let lambda = AllocatedNum::alloc(cs.namespace(|| "lambda"), || {
-      let x_diff_inv = if *x_diff_is_actual.get_value().get()? == G::Base::ONE {
+      let x_diff_inv = if *x_diff_is_actual.get_value().get()? == E::Base::ONE {
         // Set to default
-        G::Base::ONE
+        E::Base::ONE
       } else {
         // Set to the actual inverse
         (*other.x.get_value().get()? - *self.x.get_value().get()?)
@@ -322,13 +357,13 @@ where
   }
 
   /// Doubles the supplied point.
-  pub fn double<CS: ConstraintSystem<G::Base>>(&self, mut cs: CS) -> Result<Self, SynthesisError> {
+  pub fn double<CS: ConstraintSystem<E::Base>>(&self, mut cs: CS) -> Result<Self, SynthesisError> {
     //*************************************************************/
-    // lambda = (G::Base::from(3) * self.x * self.x + G::A())
-    //  * (G::Base::from(2)) * self.y).invert().unwrap();
+    // lambda = (E::Base::from(3) * self.x * self.x + E::GE::A())
+    //  * (E::Base::from(2)) * self.y).invert().unwrap();
     /*************************************************************/
 
-    // Compute tmp = (G::Base::ONE + G::Base::ONE)* self.y ? self != inf : 1
+    // Compute tmp = (E::Base::ONE + E::Base::ONE)* self.y ? self != inf : 1
     let tmp_actual = AllocatedNum::alloc(cs.namespace(|| "tmp_actual"), || {
       Ok(*self.y.get_value().get()? + *self.y.get_value().get()?)
     })?;
@@ -341,35 +376,35 @@ where
 
     let tmp = select_one_or_num2(cs.namespace(|| "tmp"), &tmp_actual, &self.is_infinity)?;
 
-    // Now compute lambda as (G::Base::from(3) * self.x * self.x + G::A()) * tmp_inv
+    // Now compute lambda as (E::Base::from(3) * self.x * self.x + E::GE::A()) * tmp_inv
 
     let prod_1 = AllocatedNum::alloc(cs.namespace(|| "alloc prod 1"), || {
-      Ok(G::Base::from(3) * self.x.get_value().get()? * self.x.get_value().get()?)
+      Ok(E::Base::from(3) * self.x.get_value().get()? * self.x.get_value().get()?)
     })?;
     cs.enforce(
       || "Check prod 1",
-      |lc| lc + (G::Base::from(3), self.x.get_variable()),
+      |lc| lc + (E::Base::from(3), self.x.get_variable()),
       |lc| lc + self.x.get_variable(),
       |lc| lc + prod_1.get_variable(),
     );
 
     let lambda = AllocatedNum::alloc(cs.namespace(|| "alloc lambda"), || {
-      let tmp_inv = if *self.is_infinity.get_value().get()? == G::Base::ONE {
+      let tmp_inv = if *self.is_infinity.get_value().get()? == E::Base::ONE {
         // Return default value 1
-        G::Base::ONE
+        E::Base::ONE
       } else {
         // Return the actual inverse
         (*tmp.get_value().get()?).invert().unwrap()
       };
 
-      Ok(tmp_inv * (*prod_1.get_value().get()? + G::get_curve_params().0))
+      Ok(tmp_inv * (*prod_1.get_value().get()? + E::GE::group_params().0))
     })?;
 
     cs.enforce(
       || "Check lambda",
       |lc| lc + tmp.get_variable(),
       |lc| lc + lambda.get_variable(),
-      |lc| lc + prod_1.get_variable() + (G::get_curve_params().0, CS::one()),
+      |lc| lc + prod_1.get_variable() + (E::GE::group_params().0, CS::one()),
     );
 
     /*************************************************************/
@@ -424,14 +459,14 @@ where
   }
 
   /// A gadget for scalar multiplication, optimized to use incomplete addition law.
-  /// The optimization here is analogous to https://github.com/arkworks-rs/r1cs-std/blob/6d64f379a27011b3629cf4c9cb38b7b7b695d5a0/src/groups/curves/short_weierstrass/mod.rs#L295,
+  /// The optimization here is analogous to <https://github.com/arkworks-rs/r1cs-std/blob/6d64f379a27011b3629cf4c9cb38b7b7b695d5a0/src/groups/curves/short_weierstrass/mod.rs#L295>,
   /// except we use complete addition law over affine coordinates instead of projective coordinates for the tail bits
-  pub fn scalar_mul<CS: ConstraintSystem<G::Base>>(
+  pub fn scalar_mul<CS: ConstraintSystem<E::Base>>(
     &self,
     mut cs: CS,
-    scalar_bits: Vec<AllocatedBit>,
+    scalar_bits: &[AllocatedBit],
   ) -> Result<Self, SynthesisError> {
-    let split_len = core::cmp::min(scalar_bits.len(), (G::Base::NUM_BITS - 2) as usize);
+    let split_len = core::cmp::min(scalar_bits.len(), (E::Base::NUM_BITS - 2) as usize);
     let (incomplete_bits, complete_bits) = scalar_bits.split_at(split_len);
 
     // we convert AllocatedPoint into AllocatedPointNonInfinity; we deal with the case where self.is_infinity = 1 below
@@ -439,8 +474,8 @@ where
 
     // we assume the first bit to be 1, so we must initialize acc to self and double it
     // we remove this assumption below
-    let mut acc = p.clone();
-    p = p.double_incomplete(cs.namespace(|| "double"))?;
+    let mut acc = p;
+    p = acc.double_incomplete(cs.namespace(|| "double"))?;
 
     // perform the double-and-add loop to compute the scalar mul using incomplete addition law
     for (i, bit) in incomplete_bits.iter().enumerate().skip(1) {
@@ -515,7 +550,7 @@ where
   }
 
   /// If condition outputs a otherwise outputs b
-  pub fn conditionally_select<CS: ConstraintSystem<G::Base>>(
+  pub fn conditionally_select<CS: ConstraintSystem<E::Base>>(
     mut cs: CS,
     a: &Self,
     b: &Self,
@@ -536,7 +571,7 @@ where
   }
 
   /// If condition outputs a otherwise infinity
-  pub fn select_point_or_infinity<CS: ConstraintSystem<G::Base>>(
+  pub fn select_point_or_infinity<CS: ConstraintSystem<E::Base>>(
     mut cs: CS,
     a: &Self,
     condition: &Boolean,
@@ -556,29 +591,26 @@ where
 }
 
 #[derive(Clone)]
-/// AllocatedPoint but one that is guaranteed to be not infinity
-pub struct AllocatedPointNonInfinity<G>
-where
-  G: Group,
-{
-  x: AllocatedNum<G::Base>,
-  y: AllocatedNum<G::Base>,
+/// `AllocatedPoint` but one that is guaranteed to be not infinity
+pub struct AllocatedPointNonInfinity<E: Engine> {
+  x: AllocatedNum<E::Base>,
+  y: AllocatedNum<E::Base>,
 }
 
-impl<G> AllocatedPointNonInfinity<G>
+impl<E> AllocatedPointNonInfinity<E>
 where
-  G: Group,
+  E: Engine,
 {
-  /// Creates a new AllocatedPointNonInfinity from the specified coordinates
-  pub fn new(x: AllocatedNum<G::Base>, y: AllocatedNum<G::Base>) -> Self {
+  /// Creates a new `AllocatedPointNonInfinity` from the specified coordinates
+  pub const fn new(x: AllocatedNum<E::Base>, y: AllocatedNum<E::Base>) -> Self {
     Self { x, y }
   }
 
   /// Allocates a new point on the curve using coordinates provided by `coords`.
-  pub fn alloc<CS>(mut cs: CS, coords: Option<(G::Base, G::Base)>) -> Result<Self, SynthesisError>
-  where
-    CS: ConstraintSystem<G::Base>,
-  {
+  pub fn alloc<CS: ConstraintSystem<E::Base>>(
+    mut cs: CS,
+    coords: Option<(E::Base, E::Base)>,
+  ) -> Result<Self, SynthesisError> {
     let x = AllocatedNum::alloc(cs.namespace(|| "x"), || {
       coords.map_or(Err(SynthesisError::AssignmentMissing), |c| Ok(c.0))
     })?;
@@ -589,19 +621,19 @@ where
     Ok(Self { x, y })
   }
 
-  /// Turns an AllocatedPoint into an AllocatedPointNonInfinity (assumes it is not infinity)
-  pub fn from_allocated_point(p: &AllocatedPoint<G>) -> Self {
+  /// Turns an `AllocatedPoint` into an `AllocatedPointNonInfinity` (assumes it is not infinity)
+  pub fn from_allocated_point(p: &AllocatedPoint<E>) -> Self {
     Self {
       x: p.x.clone(),
       y: p.y.clone(),
     }
   }
 
-  /// Returns an AllocatedPoint from an AllocatedPointNonInfinity
+  /// Returns an `AllocatedPoint` from an `AllocatedPointNonInfinity`
   pub fn to_allocated_point(
     &self,
-    is_infinity: &AllocatedNum<G::Base>,
-  ) -> Result<AllocatedPoint<G>, SynthesisError> {
+    is_infinity: &AllocatedNum<E::Base>,
+  ) -> Result<AllocatedPoint<E>, SynthesisError> {
     Ok(AllocatedPoint {
       x: self.x.clone(),
       y: self.y.clone(),
@@ -610,19 +642,19 @@ where
   }
 
   /// Returns coordinates associated with the point.
-  pub fn get_coordinates(&self) -> (&AllocatedNum<G::Base>, &AllocatedNum<G::Base>) {
+  pub const fn get_coordinates(&self) -> (&AllocatedNum<E::Base>, &AllocatedNum<E::Base>) {
     (&self.x, &self.y)
   }
 
   /// Add two points assuming self != +/- other
   pub fn add_incomplete<CS>(&self, mut cs: CS, other: &Self) -> Result<Self, SynthesisError>
   where
-    CS: ConstraintSystem<G::Base>,
+    CS: ConstraintSystem<E::Base>,
   {
     // allocate a free variable that an honest prover sets to lambda = (y2-y1)/(x2-x1)
     let lambda = AllocatedNum::alloc(cs.namespace(|| "lambda"), || {
       if *other.x.get_value().get()? == *self.x.get_value().get()? {
-        Ok(G::Base::ONE)
+        Ok(E::Base::ONE)
       } else {
         Ok(
           (*other.y.get_value().get()? - *self.y.get_value().get()?)
@@ -677,19 +709,19 @@ where
   }
 
   /// doubles the point; since this is called with a point not at infinity, it is guaranteed to be not infinity
-  pub fn double_incomplete<CS>(&self, mut cs: CS) -> Result<Self, SynthesisError>
-  where
-    CS: ConstraintSystem<G::Base>,
-  {
+  pub fn double_incomplete<CS: ConstraintSystem<E::Base>>(
+    &self,
+    mut cs: CS,
+  ) -> Result<Self, SynthesisError> {
     // lambda = (3 x^2 + a) / 2 * y
 
     let x_sq = self.x.square(cs.namespace(|| "x_sq"))?;
 
     let lambda = AllocatedNum::alloc(cs.namespace(|| "lambda"), || {
-      let n = G::Base::from(3) * x_sq.get_value().get()? + G::get_curve_params().0;
-      let d = G::Base::from(2) * *self.y.get_value().get()?;
-      if d == G::Base::ZERO {
-        Ok(G::Base::ONE)
+      let n = E::Base::from(3) * x_sq.get_value().get()? + E::GE::group_params().0;
+      let d = E::Base::from(2) * *self.y.get_value().get()?;
+      if d == E::Base::ZERO {
+        Ok(E::Base::ONE)
       } else {
         Ok(n * d.invert().unwrap())
       }
@@ -697,8 +729,8 @@ where
     cs.enforce(
       || "Check that lambda is computed correctly",
       |lc| lc + lambda.get_variable(),
-      |lc| lc + (G::Base::from(2), self.y.get_variable()),
-      |lc| lc + (G::Base::from(3), x_sq.get_variable()) + (G::get_curve_params().0, CS::one()),
+      |lc| lc + (E::Base::from(2), self.y.get_variable()),
+      |lc| lc + (E::Base::from(3), x_sq.get_variable()) + (E::GE::group_params().0, CS::one()),
     );
 
     let x = AllocatedNum::alloc(cs.namespace(|| "x"), || {
@@ -713,7 +745,7 @@ where
       || "check that x is correct",
       |lc| lc + lambda.get_variable(),
       |lc| lc + lambda.get_variable(),
-      |lc| lc + x.get_variable() + (G::Base::from(2), self.x.get_variable()),
+      |lc| lc + x.get_variable() + (E::Base::from(2), self.x.get_variable()),
     );
 
     let y = AllocatedNum::alloc(cs.namespace(|| "y"), || {
@@ -734,7 +766,7 @@ where
   }
 
   /// If condition outputs a otherwise outputs b
-  pub fn conditionally_select<CS: ConstraintSystem<G::Base>>(
+  pub fn conditionally_select<CS: ConstraintSystem<E::Base>>(
     mut cs: CS,
     a: &Self,
     b: &Self,
@@ -750,37 +782,39 @@ where
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::bellperson::{
-    r1cs::{NovaShape, NovaWitness},
-    {shape_cs::ShapeCS, solver::SatisfyingAssignment},
+  use crate::{
+    bellpepper::{
+      r1cs::{NovaShape, NovaWitness},
+      {solver::SatisfyingAssignment, test_shape_cs::TestShapeCS},
+    },
+    provider::{
+      bn256_grumpkin::{bn256, grumpkin},
+      secp_secq::{secp256k1, secq256k1},
+      Bn256EngineKZG, GrumpkinEngine, Secp256k1Engine, Secq256k1Engine,
+      {PallasEngine, VestaEngine},
+    },
+    traits::snark::default_ck_hint,
   };
   use ff::{Field, PrimeFieldBits};
   use pasta_curves::{arithmetic::CurveAffine, group::Curve, pallas, vesta};
   use rand::rngs::OsRng;
 
   #[derive(Debug, Clone)]
-  pub struct Point<G>
-  where
-    G: Group,
-  {
-    x: G::Base,
-    y: G::Base,
+  pub struct Point<E: Engine> {
+    x: E::Base,
+    y: E::Base,
     is_infinity: bool,
   }
 
-  #[cfg(test)]
-  impl<G> Point<G>
-  where
-    G: Group,
-  {
-    pub fn new(x: G::Base, y: G::Base, is_infinity: bool) -> Self {
+  impl<E: Engine> Point<E> {
+    pub fn new(x: E::Base, y: E::Base, is_infinity: bool) -> Self {
       Self { x, y, is_infinity }
     }
 
     pub fn random_vartime() -> Self {
       loop {
-        let x = G::Base::random(&mut OsRng);
-        let y = (x.square() * x + G::get_curve_params().1).sqrt();
+        let x = E::Base::random(&mut OsRng);
+        let y = (x.square() * x + E::GE::group_params().1).sqrt();
         if y.is_some().unwrap_u8() == 1 {
           return Self {
             x,
@@ -792,7 +826,7 @@ mod tests {
     }
 
     /// Add any two points
-    pub fn add(&self, other: &Point<G>) -> Self {
+    pub fn add(&self, other: &Point<E>) -> Self {
       if self.x == other.x {
         // If self == other then call double
         if self.y == other.y {
@@ -800,8 +834,8 @@ mod tests {
         } else {
           // if self.x == other.x and self.y != other.y then return infinity
           Self {
-            x: G::Base::ZERO,
-            y: G::Base::ZERO,
+            x: E::Base::ZERO,
+            y: E::Base::ZERO,
             is_infinity: true,
           }
         }
@@ -811,7 +845,7 @@ mod tests {
     }
 
     /// Add two different points
-    pub fn add_internal(&self, other: &Point<G>) -> Self {
+    pub fn add_internal(&self, other: &Point<E>) -> Self {
       if self.is_infinity {
         return other.clone();
       }
@@ -833,16 +867,16 @@ mod tests {
     pub fn double(&self) -> Self {
       if self.is_infinity {
         return Self {
-          x: G::Base::ZERO,
-          y: G::Base::ZERO,
+          x: E::Base::ZERO,
+          y: E::Base::ZERO,
           is_infinity: true,
         };
       }
 
-      let lambda = G::Base::from(3)
+      let lambda = E::Base::from(3)
         * self.x
         * self.x
-        * ((G::Base::ONE + G::Base::ONE) * self.y).invert().unwrap();
+        * ((E::Base::ONE + E::Base::ONE) * self.y).invert().unwrap();
       let x = lambda * lambda - self.x - self.x;
       let y = lambda * (self.x - x) - self.y;
       Self {
@@ -852,10 +886,10 @@ mod tests {
       }
     }
 
-    pub fn scalar_mul(&self, scalar: &G::Scalar) -> Self {
+    pub fn scalar_mul(&self, scalar: &E::Scalar) -> Self {
       let mut res = Self {
-        x: G::Base::ZERO,
-        y: G::Base::ZERO,
+        x: E::Base::ZERO,
+        y: E::Base::ZERO,
         is_infinity: true,
       };
 
@@ -871,44 +905,49 @@ mod tests {
   }
 
   // Allocate a random point. Only used for testing
-  pub fn alloc_random_point<G: Group, CS: ConstraintSystem<G::Base>>(
+  pub fn alloc_random_point<E: Engine, CS: ConstraintSystem<E::Base>>(
     mut cs: CS,
-  ) -> Result<AllocatedPoint<G>, SynthesisError> {
+  ) -> Result<AllocatedPoint<E>, SynthesisError> {
     // get a random point
-    let p = Point::<G>::random_vartime();
+    let p = Point::<E>::random_vartime();
     AllocatedPoint::alloc(cs.namespace(|| "alloc p"), Some((p.x, p.y, p.is_infinity)))
   }
 
   /// Make the point io
-  pub fn inputize_allocted_point<G: Group, CS: ConstraintSystem<G::Base>>(
-    p: &AllocatedPoint<G>,
+  pub fn inputize_allocted_point<E: Engine, CS: ConstraintSystem<E::Base>>(
+    p: &AllocatedPoint<E>,
     mut cs: CS,
-  ) -> Result<(), SynthesisError> {
+  ) {
     let _ = p.x.inputize(cs.namespace(|| "Input point.x"));
     let _ = p.y.inputize(cs.namespace(|| "Input point.y"));
     let _ = p
       .is_infinity
       .inputize(cs.namespace(|| "Input point.is_infinity"));
-    Ok(())
   }
 
   #[test]
   fn test_ecc_ops() {
-    test_ecc_ops_with::<pallas::Affine, pallas::Point>();
-    test_ecc_ops_with::<vesta::Affine, vesta::Point>();
+    test_ecc_ops_with::<pallas::Affine, PallasEngine>();
+    test_ecc_ops_with::<vesta::Affine, VestaEngine>();
+
+    test_ecc_ops_with::<bn256::Affine, Bn256EngineKZG>();
+    test_ecc_ops_with::<grumpkin::Affine, GrumpkinEngine>();
+
+    test_ecc_ops_with::<secp256k1::Affine, Secp256k1Engine>();
+    test_ecc_ops_with::<secq256k1::Affine, Secq256k1Engine>();
   }
 
-  fn test_ecc_ops_with<C, G>()
+  fn test_ecc_ops_with<C, E>()
   where
-    C: CurveAffine<Base = G::Base, ScalarExt = G::Scalar>,
-    G: Group,
+    E: Engine,
+    C: CurveAffine<Base = E::Base, ScalarExt = E::Scalar>,
   {
     // perform some curve arithmetic
-    let a = Point::<G>::random_vartime();
-    let b = Point::<G>::random_vartime();
+    let a = Point::<E>::random_vartime();
+    let b = Point::<E>::random_vartime();
     let c = a.add(&b);
     let d = a.double();
-    let s = <G as Group>::Scalar::random(&mut OsRng);
+    let s = <E as Engine>::Scalar::random(&mut OsRng);
     let e = a.scalar_mul(&s);
 
     // perform the same computation by translating to curve types
@@ -951,15 +990,15 @@ mod tests {
     assert_eq!(e_curve, e_curve_2);
   }
 
-  fn synthesize_smul<G, CS>(mut cs: CS) -> (AllocatedPoint<G>, AllocatedPoint<G>, G::Scalar)
+  fn synthesize_smul<E, CS>(mut cs: CS) -> (AllocatedPoint<E>, AllocatedPoint<E>, E::Scalar)
   where
-    G: Group,
-    CS: ConstraintSystem<G::Base>,
+    E: Engine,
+    CS: ConstraintSystem<E::Base>,
   {
     let a = alloc_random_point(cs.namespace(|| "a")).unwrap();
-    inputize_allocted_point(&a, cs.namespace(|| "inputize a")).unwrap();
+    inputize_allocted_point(&a, cs.namespace(|| "inputize a"));
 
-    let s = G::Scalar::random(&mut OsRng);
+    let s = E::Scalar::random(&mut OsRng);
     // Allocate bits for s
     let bits: Vec<AllocatedBit> = s
       .to_le_bits()
@@ -968,42 +1007,48 @@ mod tests {
       .map(|(i, bit)| AllocatedBit::alloc(cs.namespace(|| format!("bit {i}")), Some(bit)))
       .collect::<Result<Vec<AllocatedBit>, SynthesisError>>()
       .unwrap();
-    let e = a.scalar_mul(cs.namespace(|| "Scalar Mul"), bits).unwrap();
-    inputize_allocted_point(&e, cs.namespace(|| "inputize e")).unwrap();
+    let e = a.scalar_mul(cs.namespace(|| "Scalar Mul"), &bits).unwrap();
+    inputize_allocted_point(&e, cs.namespace(|| "inputize e"));
     (a, e, s)
   }
 
   #[test]
   fn test_ecc_circuit_ops() {
-    test_ecc_circuit_ops_with::<pallas::Point, vesta::Point>();
-    test_ecc_circuit_ops_with::<vesta::Point, pallas::Point>();
+    test_ecc_circuit_ops_with::<PallasEngine, VestaEngine>();
+    test_ecc_circuit_ops_with::<VestaEngine, PallasEngine>();
+
+    test_ecc_circuit_ops_with::<Bn256EngineKZG, GrumpkinEngine>();
+    test_ecc_circuit_ops_with::<GrumpkinEngine, Bn256EngineKZG>();
+
+    test_ecc_circuit_ops_with::<Secp256k1Engine, Secq256k1Engine>();
+    test_ecc_circuit_ops_with::<Secq256k1Engine, Secp256k1Engine>();
   }
 
-  fn test_ecc_circuit_ops_with<G1, G2>()
+  fn test_ecc_circuit_ops_with<E1, E2>()
   where
-    G1: Group<Base = <G2 as Group>::Scalar>,
-    G2: Group<Base = <G1 as Group>::Scalar>,
+    E1: Engine<Base = <E2 as Engine>::Scalar>,
+    E2: Engine<Base = <E1 as Engine>::Scalar>,
   {
     // First create the shape
-    let mut cs: ShapeCS<G2> = ShapeCS::new();
-    let _ = synthesize_smul::<G1, _>(cs.namespace(|| "synthesize"));
+    let mut cs: TestShapeCS<E2> = TestShapeCS::new();
+    let _ = synthesize_smul::<E1, _>(cs.namespace(|| "synthesize"));
     println!("Number of constraints: {}", cs.num_constraints());
-    let (shape, ck) = cs.r1cs_shape();
+    let (shape, ck) = cs.r1cs_shape(&*default_ck_hint());
 
     // Then the satisfying assignment
-    let mut cs: SatisfyingAssignment<G2> = SatisfyingAssignment::new();
-    let (a, e, s) = synthesize_smul::<G1, _>(cs.namespace(|| "synthesize"));
+    let mut cs = SatisfyingAssignment::<E2>::new();
+    let (a, e, s) = synthesize_smul::<E1, _>(cs.namespace(|| "synthesize"));
     let (inst, witness) = cs.r1cs_instance_and_witness(&shape, &ck).unwrap();
 
-    let a_p: Point<G1> = Point::new(
+    let a_p: Point<E1> = Point::new(
       a.x.get_value().unwrap(),
       a.y.get_value().unwrap(),
-      a.is_infinity.get_value().unwrap() == <G1 as Group>::Base::ONE,
+      a.is_infinity.get_value().unwrap() == <E1 as Engine>::Base::ONE,
     );
-    let e_p: Point<G1> = Point::new(
+    let e_p: Point<E1> = Point::new(
       e.x.get_value().unwrap(),
       e.y.get_value().unwrap(),
-      e.is_infinity.get_value().unwrap() == <G1 as Group>::Base::ONE,
+      e.is_infinity.get_value().unwrap() == <E1 as Engine>::Base::ONE,
     );
     let e_new = a_p.scalar_mul(&s);
     assert!(e_p.x == e_new.x && e_p.y == e_new.y);
@@ -1011,48 +1056,54 @@ mod tests {
     assert!(shape.is_sat(&ck, &inst, &witness).is_ok());
   }
 
-  fn synthesize_add_equal<G, CS>(mut cs: CS) -> (AllocatedPoint<G>, AllocatedPoint<G>)
+  fn synthesize_add_equal<E, CS>(mut cs: CS) -> (AllocatedPoint<E>, AllocatedPoint<E>)
   where
-    G: Group,
-    CS: ConstraintSystem<G::Base>,
+    E: Engine,
+    CS: ConstraintSystem<E::Base>,
   {
     let a = alloc_random_point(cs.namespace(|| "a")).unwrap();
-    inputize_allocted_point(&a, cs.namespace(|| "inputize a")).unwrap();
+    inputize_allocted_point(&a, cs.namespace(|| "inputize a"));
     let e = a.add(cs.namespace(|| "add a to a"), &a).unwrap();
-    inputize_allocted_point(&e, cs.namespace(|| "inputize e")).unwrap();
+    inputize_allocted_point(&e, cs.namespace(|| "inputize e"));
     (a, e)
   }
 
   #[test]
   fn test_ecc_circuit_add_equal() {
-    test_ecc_circuit_add_equal_with::<pallas::Point, vesta::Point>();
-    test_ecc_circuit_add_equal_with::<vesta::Point, pallas::Point>();
+    test_ecc_circuit_add_equal_with::<PallasEngine, VestaEngine>();
+    test_ecc_circuit_add_equal_with::<VestaEngine, PallasEngine>();
+
+    test_ecc_circuit_add_equal_with::<Bn256EngineKZG, GrumpkinEngine>();
+    test_ecc_circuit_add_equal_with::<GrumpkinEngine, Bn256EngineKZG>();
+
+    test_ecc_circuit_add_equal_with::<Secp256k1Engine, Secq256k1Engine>();
+    test_ecc_circuit_add_equal_with::<Secq256k1Engine, Secp256k1Engine>();
   }
 
-  fn test_ecc_circuit_add_equal_with<G1, G2>()
+  fn test_ecc_circuit_add_equal_with<E1, E2>()
   where
-    G1: Group<Base = <G2 as Group>::Scalar>,
-    G2: Group<Base = <G1 as Group>::Scalar>,
+    E1: Engine<Base = <E2 as Engine>::Scalar>,
+    E2: Engine<Base = <E1 as Engine>::Scalar>,
   {
     // First create the shape
-    let mut cs: ShapeCS<G2> = ShapeCS::new();
-    let _ = synthesize_add_equal::<G1, _>(cs.namespace(|| "synthesize add equal"));
+    let mut cs: TestShapeCS<E2> = TestShapeCS::new();
+    let _ = synthesize_add_equal::<E1, _>(cs.namespace(|| "synthesize add equal"));
     println!("Number of constraints: {}", cs.num_constraints());
-    let (shape, ck) = cs.r1cs_shape();
+    let (shape, ck) = cs.r1cs_shape(&*default_ck_hint());
 
     // Then the satisfying assignment
-    let mut cs: SatisfyingAssignment<G2> = SatisfyingAssignment::new();
-    let (a, e) = synthesize_add_equal::<G1, _>(cs.namespace(|| "synthesize add equal"));
+    let mut cs = SatisfyingAssignment::<E2>::new();
+    let (a, e) = synthesize_add_equal::<E1, _>(cs.namespace(|| "synthesize add equal"));
     let (inst, witness) = cs.r1cs_instance_and_witness(&shape, &ck).unwrap();
-    let a_p: Point<G1> = Point::new(
+    let a_p: Point<E1> = Point::new(
       a.x.get_value().unwrap(),
       a.y.get_value().unwrap(),
-      a.is_infinity.get_value().unwrap() == <G1 as Group>::Base::ONE,
+      a.is_infinity.get_value().unwrap() == <E1 as Engine>::Base::ONE,
     );
-    let e_p: Point<G1> = Point::new(
+    let e_p: Point<E1> = Point::new(
       e.x.get_value().unwrap(),
       e.y.get_value().unwrap(),
-      e.is_infinity.get_value().unwrap() == <G1 as Group>::Base::ONE,
+      e.is_infinity.get_value().unwrap() == <E1 as Engine>::Base::ONE,
     );
     let e_new = a_p.add(&a_p);
     assert!(e_p.x == e_new.x && e_p.y == e_new.y);
@@ -1060,48 +1111,54 @@ mod tests {
     assert!(shape.is_sat(&ck, &inst, &witness).is_ok());
   }
 
-  fn synthesize_add_negation<G, CS>(mut cs: CS) -> AllocatedPoint<G>
+  fn synthesize_add_negation<E, CS>(mut cs: CS) -> AllocatedPoint<E>
   where
-    G: Group,
-    CS: ConstraintSystem<G::Base>,
+    E: Engine,
+    CS: ConstraintSystem<E::Base>,
   {
     let a = alloc_random_point(cs.namespace(|| "a")).unwrap();
-    inputize_allocted_point(&a, cs.namespace(|| "inputize a")).unwrap();
-    let mut b = a.clone();
+    inputize_allocted_point(&a, cs.namespace(|| "inputize a"));
+    let b = &mut a.clone();
     b.y = AllocatedNum::alloc(cs.namespace(|| "allocate negation of a"), || {
-      Ok(G::Base::ZERO)
+      Ok(E::Base::ZERO)
     })
     .unwrap();
-    inputize_allocted_point(&b, cs.namespace(|| "inputize b")).unwrap();
-    let e = a.add(cs.namespace(|| "add a to b"), &b).unwrap();
+    inputize_allocted_point(b, cs.namespace(|| "inputize b"));
+    let e = a.add(cs.namespace(|| "add a to b"), b).unwrap();
     e
   }
 
   #[test]
   fn test_ecc_circuit_add_negation() {
-    test_ecc_circuit_add_negation_with::<pallas::Point, vesta::Point>();
-    test_ecc_circuit_add_negation_with::<vesta::Point, pallas::Point>();
+    test_ecc_circuit_add_negation_with::<PallasEngine, VestaEngine>();
+    test_ecc_circuit_add_negation_with::<VestaEngine, PallasEngine>();
+
+    test_ecc_circuit_add_negation_with::<Bn256EngineKZG, GrumpkinEngine>();
+    test_ecc_circuit_add_negation_with::<GrumpkinEngine, Bn256EngineKZG>();
+
+    test_ecc_circuit_add_negation_with::<Secp256k1Engine, Secq256k1Engine>();
+    test_ecc_circuit_add_negation_with::<Secq256k1Engine, Secp256k1Engine>();
   }
 
-  fn test_ecc_circuit_add_negation_with<G1, G2>()
+  fn test_ecc_circuit_add_negation_with<E1, E2>()
   where
-    G1: Group<Base = <G2 as Group>::Scalar>,
-    G2: Group<Base = <G1 as Group>::Scalar>,
+    E1: Engine<Base = <E2 as Engine>::Scalar>,
+    E2: Engine<Base = <E1 as Engine>::Scalar>,
   {
     // First create the shape
-    let mut cs: ShapeCS<G2> = ShapeCS::new();
-    let _ = synthesize_add_negation::<G1, _>(cs.namespace(|| "synthesize add equal"));
+    let mut cs: TestShapeCS<E2> = TestShapeCS::new();
+    let _ = synthesize_add_negation::<E1, _>(cs.namespace(|| "synthesize add equal"));
     println!("Number of constraints: {}", cs.num_constraints());
-    let (shape, ck) = cs.r1cs_shape();
+    let (shape, ck) = cs.r1cs_shape(&*default_ck_hint());
 
     // Then the satisfying assignment
-    let mut cs: SatisfyingAssignment<G2> = SatisfyingAssignment::new();
-    let e = synthesize_add_negation::<G1, _>(cs.namespace(|| "synthesize add negation"));
+    let mut cs = SatisfyingAssignment::<E2>::new();
+    let e = synthesize_add_negation::<E1, _>(cs.namespace(|| "synthesize add negation"));
     let (inst, witness) = cs.r1cs_instance_and_witness(&shape, &ck).unwrap();
-    let e_p: Point<G1> = Point::new(
+    let e_p: Point<E1> = Point::new(
       e.x.get_value().unwrap(),
       e.y.get_value().unwrap(),
-      e.is_infinity.get_value().unwrap() == <G1 as Group>::Base::ONE,
+      e.is_infinity.get_value().unwrap() == <E1 as Engine>::Base::ONE,
     );
     assert!(e_p.is_infinity);
     // Make sure that it is satisfiable
